@@ -1,0 +1,24 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Models & Large Files (Excluded to save space)
+sam_models/
+archive_old/
+*.pt
+*.pth
+runs/
+runs/**/benchmark.json
+datasets/images/
+datasets/labels/
+datasets/labels_backup*/
+datasets/vis_labels/
+app_backup.py
+
+# Logs & OS
+*.log
+.DS_Store
+Thumbs.db
