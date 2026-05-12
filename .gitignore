@@ -10,6 +10,11 @@ sam_models/
 archive_old/
 *.pt
 *.pth
+runs/
+runs/**/benchmark.json
+datasets/images/
+datasets/labels/
+app_backup.py
 
 # Logs & OS
 *.log

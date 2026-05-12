@@ -1,40 +1,56 @@
 """
-多模态大模型 API 接入模块
-SiliconFlow API - 支持 Kimi-K2.5 等视觉模型
+植物病害多模态分析核心 API 模块 (增强版)
+支持 SiliconFlow API，具备自动重试、详尽错误处理和多模态适配功能。
 """
 
 import base64
 import json
 import io
-from typing import Optional
-
-import numpy as np
+import time
 import requests
+import numpy as np
+from PIL import Image
+from typing import Optional, Dict, Any, List
 
+# --- 全局配置 ---
 API_URL = "https://api.siliconflow.cn/v1/chat/completions"
-# 默认使用 Kimi-K2.5，支持视觉
-DEFAULT_MODEL = "Pro/moonshotai/Kimi-K2.5"
+DEFAULT_API_KEY = "sk-tjiwupnjibyvegdommtafazxynchqxykdedlwrwenjhfizty"
 
-# 预设提示词 - 叶片病害分析
-DEFAULT_PROMPT = """请仔细观察这张植物叶片图片，分析其中可能存在的病害情况。
-如果发现异常，请说明：
-1. 病害类型或可能原因
-2. 病害的严重程度（轻/中/重）
-3. 简要的防治建议
+MODELS = {
+    "Kimi-K2.6 (视觉)": "Pro/moonshotai/Kimi-K2.6",
+    "DeepSeek-V4 (纯文本)": "deepseek-ai/DeepSeek-V4-Flash",
+    "GLM-5.1 (纯文本)": "Pro/zai-org/GLM-5.1",
+    "MiniMax-M2.5 (纯文本)": "Pro/MiniMaxAI/MiniMax-M2.5",
+    "Qwen-3.5 (纯文本/视觉)": "Qwen/Qwen3.5-397B-A17B",
+}
 
-如果没有明显病害，请说明叶片健康状况。"""
+DEFAULT_MODEL = MODELS["Kimi-K2.6 (视觉)"]
 
+DEFAULT_PROMPT = """你是一个专业的植物病理学家。
+请仔细观察这张图片中的植物叶片，结合 YOLO 检测到的病害结果（如果有），给出：
+1. 病害症状的详细描述。
+2. 科学的防治建议（物理防治、生物防治、化学防治）。
+3. 预防措施，防止病害再次发生。"""
 
-def image_to_base64(image: np.ndarray, format: str = "jpeg") -> str:
-    """将 numpy 图片转为 base64 字符串"""
-    from PIL import Image
-    if image is None:
-        raise ValueError("图片为空")
-    pil_img = Image.fromarray(image.astype(np.uint8) if image.dtype != np.uint8 else image)
-    buf = io.BytesIO()
-    pil_img.save(buf, format=format.upper(), quality=85)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+class SiliconFlowError(Exception):
+    """自定义 API 异常类"""
+    def __init__(self, message, error_type=None, status_code=None):
+        super().__init__(message)
+        self.error_type = error_type
+        self.status_code = status_code
 
+def image_to_base64(image: np.ndarray) -> str:
+    """将 numpy 图片转为 base64 字符串，包含异常处理"""
+    try:
+        if image is None:
+            return ""
+        pil_img = Image.fromarray(image.astype(np.uint8))
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        print(f"--- [图片转换失败]: {e} ---")
+        return ""
 
 def call_vision_api(
     image: np.ndarray,
@@ -42,79 +58,98 @@ def call_vision_api(
     api_key: str = "",
     model: str = DEFAULT_MODEL,
     temperature: float = 0.7,
-    max_tokens: int = 1000,
+    max_tokens: int = 1500,
+    max_retries: int = 3,
 ) -> str:
     """
-    调用 SiliconFlow 多模态 API，传入图片和文本提示。
-    
-    Args:
-        image: numpy 格式图片 (H, W, C)
-        prompt: 用户提示词
-        api_key: API Key，为空时从环境变量 SILICONFLOW_API_KEY 读取
-        model: 模型名称
-        temperature: 温度参数
-        max_tokens: 最大输出 token
-    
-    Returns:
-        模型返回的文本内容
+    调用 SiliconFlow API (增强型)。
+    具备自动重试机制、超时管理和详尽的错误解析。
     """
-    import os
-    key = api_key or os.environ.get("SILICONFLOW_API_KEY", "")
+    key = api_key or DEFAULT_API_KEY
     if not key:
-        return "❌ 请先设置 API Key：在输入框中填写，或设置环境变量 SILICONFLOW_API_KEY"
-    
+        return "❌ 错误: 未配置 API Key。"
+
+    # 识别视觉模型
+    vision_keywords = ["Kimi", "GLM-4V", "vlm", "vision", "Qwen"]
+    is_vision_model = any(k in model for k in vision_keywords)
+
+    # 准备 Payload
     try:
-        b64 = image_to_base64(image)
-        data_url = f"data:image/jpeg;base64,{b64}"
-        
+        if is_vision_model:
+            b64 = image_to_base64(image)
+            if not b64:
+                content = prompt + "\n(注：图片转换失败，已按纯文本模式诊断)"
+            else:
+                content = [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]
+        else:
+            content = prompt
+
         payload = {
             "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": data_url,
-                                "detail": "auto",
-                            },
-                        },
-                    ],
-                }
-            ],
+            "messages": [{"role": "user", "content": content}],
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "stream": False # 暂不支持流式返回到 UI
         }
         
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {key}",
+            "Authorization": f"Bearer {key.strip()}",
         }
-        
-        resp = requests.post(API_URL, json=payload, headers=headers, timeout=60)
-        resp.raise_for_status()
-        
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        return content.strip()
-    
-    except requests.exceptions.Timeout:
-        return "❌ 请求超时，请稍后重试"
-    except requests.exceptions.RequestException as e:
-        if hasattr(e, "response") and e.response is not None:
-            try:
-                err_data = e.response.json()
-                msg = err_data.get("error", {}).get("message", str(e))
-            except Exception:
-                msg = e.response.text or str(e)
-        else:
-            msg = str(e)
-        return f"❌ API 请求失败：{msg}"
-    except (KeyError, IndexError) as e:
-        return f"❌ 解析响应失败：{e}"
     except Exception as e:
-        return f"❌ 错误：{type(e).__name__}: {e}"
-# 别名，兼容旧版代码引用
+        return f"❌ 构造请求失败: {e}"
+
+    # 带重试机制的请求循环
+    last_error = ""
+    for attempt in range(max_retries):
+        try:
+            print(f"--- [AI 请求] 尝试 {attempt+1}/{max_retries}, 模型: {model} ---")
+            
+            # 使用较长的读取超时，因为 VLM 推理较慢
+            response = requests.post(
+                API_URL, 
+                json=payload, 
+                headers=headers, 
+                timeout=(10, 150) # (连接超时, 读取超时)
+            )
+            
+            # 状态码处理
+            if response.status_code == 200:
+                data = response.json()
+                return data["choices"][0]["message"]["content"].strip()
+            
+            # 错误解析
+            error_msg = f"HTTP {response.status_code}"
+            try:
+                err_json = response.json()
+                error_msg = err_json.get("error", {}).get("message", error_msg)
+            except:
+                error_msg = response.text or error_msg
+            
+            # 如果是限速或服务器忙，触发重试
+            if response.status_code in [429, 500, 502, 503, 504]:
+                wait_time = (attempt + 1) * 3
+                print(f"--- [API 繁忙] {error_msg}, {wait_time}秒后重试... ---")
+                time.sleep(wait_time)
+                last_error = error_msg
+                continue
+            else:
+                # 业务错误（如 Key 错、余额不足等）直接返回
+                return f"❌ AI 服务商报错: {error_msg}"
+
+        except requests.exceptions.Timeout:
+            last_error = "请求响应超时 (Wait Timeout)"
+            print(f"--- [超时] 尝试 {attempt+1} 失败 ---")
+        except requests.exceptions.RequestException as e:
+            last_error = f"网络连接异常: {str(e)}"
+            print(f"--- [网络错误] {e} ---")
+            
+        time.sleep(2) # 基础重试间隔
+
+    return f"❌ AI 诊断失败 (已尝试{max_retries}次): {last_error}"
+
+# 别名兼容旧代码
 ask_multimodal = call_vision_api

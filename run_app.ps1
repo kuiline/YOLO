@@ -1,34 +1,37 @@
-# 植物叶片病害检测系统 - 启动脚本 (支持热更新与自动打开浏览器)
-$env:NO_PROXY = "127.0.0.1,localhost,*"
-$env:no_proxy = "127.0.0.1,localhost,*"
+# 植物病害检测系统 - 全自动启动脚本
+# 功能：自动热重载代码 + 自动打开浏览器
 
-$Root = $PSScriptRoot
-Set-Location $Root
+$ServerUrl = "http://127.0.0.1:7860"
 
-# 检查环境
-if (-not (Test-Path "$Root\venv\Scripts\python.exe")) {
-    Write-Host "❌ 错误: 未找到虚拟环境 venv" -ForegroundColor Red
-    Read-Host "请先运行安装脚本或配置环境。按回车退出..."
-    exit 1
+# 1. 确保环境正常
+if (!(Test-Path "venv")) {
+    Write-Host "--- [错误] 未发现虚拟环境 venv，请先创建它 ---" -ForegroundColor Red
+    exit
 }
 
-$Url = "http://127.0.0.1:7860"
+Write-Host "--- [启动] 正在以热重载模式启动 Gradio 终端... ---" -ForegroundColor Cyan
+Write-Host "--- [提示] 修改代码后保存，系统将自动重新加载 ---" -ForegroundColor Gray
 
-# 使用后台作业在 3 秒后打开浏览器（给后端启动留出时间）
+# 2. 异步启动浏览器（等待端口开放）
 Start-Job -ScriptBlock {
-    param($u)
-    Start-Sleep -Seconds 3
-    Start-Process $u
-} -ArgumentList $Url | Out-Null
+    $url = $using:ServerUrl
+    while ($true) {
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $tcp.Connect("127.0.0.1", 7860)
+            if ($tcp.Connected) {
+                $tcp.Close()
+                Write-Host "--- [检测] 端口已开放，正在打开浏览器... ---"
+                Start-Process $url
+                break
+            }
+        } catch {
+            # 继续等待
+        }
+        Start-Sleep -Seconds 1
+    }
+} | Out-Null
 
-Write-Host "----------------------------------------------------" -ForegroundColor Cyan
-Write-Host "🚀 正在启动系统 [开发热更新模式]" -ForegroundColor Green
-Write-Host "🌐 访问地址: $Url" -ForegroundColor Cyan
-Write-Host "🔥 修改 app.py 或其他相关源码后，系统将自动重新加载。" -ForegroundColor Yellow
-Write-Host "----------------------------------------------------" -ForegroundColor Cyan
-
-# 使用 gradio CLI 启动以支持代码热更新 (Hot Reload)
-# 如果只需要运行而不监控代码变化，可以使用: & "$Root\venv\Scripts\python.exe" "$Root\app.py"
-& "$Root\venv\Scripts\gradio.exe" "$Root\app.py"
-
-Read-Host "程序已退出。按回车关闭窗口..."
+# 3. 运行 Gradio 开发模式（自带监听器）
+# 使用 gradio 命令行工具可以实现完美的监听和自动重启
+.\venv\Scripts\python.exe -m gradio app.py
