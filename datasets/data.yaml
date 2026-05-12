@@ -1,0 +1,12 @@
+# 本项目数据集 - 用于叶片病害检测
+# path: 相对于运行 train.py 时的工作目录（项目根目录）
+path: datasets
+train: images/train
+val: images/val
+test: images/test
+
+# number of classes
+nc: 5
+
+# class names
+names: ['Rust', 'Mosaic', 'Grey_spot', 'Brown_Spot', 'Alternaria_Boltch']

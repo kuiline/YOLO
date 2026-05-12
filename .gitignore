@@ -1,0 +1,17 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Models & Large Files (Excluded to save space)
+sam_models/
+archive_old/
+*.pt
+*.pth
+
+# Logs & OS
+*.log
+.DS_Store
+Thumbs.db
