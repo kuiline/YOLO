@@ -20,7 +20,6 @@ biyesheji/
 ├── sam_config.py               # SAM2 路径、权重目录、加载状态文案
 ├── sam_leaf_segment.py         # 叶片 SAM 分割 / 病害区域分析（供 app 或脚本调用）
 ├── multimodal_api.py           # 多模态 / 外部 API 相关逻辑（由 app 引用）
-├── compare_sam_leaf_yolo.py    # SAM 与 YOLO 对比实验脚本（独立运行，非 Gradio 必需）
 ├── requirements.txt
 ├── README.md
 ├── .gitignore
@@ -60,7 +59,6 @@ biyesheji/
 | `sam_config.py` | 把 `sam2-main` 加入 `sys.path`、拼接 `sam_models` 下权重路径、返回加载失败时的提示文案。 |
 | `sam_leaf_segment.py` | 叶片分割、病害区域占比等图像逻辑，供 Gradio 或离线脚本复用。 |
 | `multimodal_api.py` | 与「多模态 / 问答 / 外部接口」相关的后端封装。 |
-| `compare_sam_leaf_yolo.py` | 离线对比 SAM 与 YOLO 输出的实验脚本；答辩写「对比实验」时可引用。 |
 | `requirements.txt` | pip 依赖列表；含 `gradio`、`ultralytics` 及 SAM2 所需项等。 |
 | `run_app.bat` / `run_app.ps1` | 在已创建 `venv` 的前提下启动 `app.py`。 |
 | `run_train.ps1` | 可选：统一训练参数、工作目录的 PowerShell 示例。 |
