@@ -21,13 +21,36 @@ import plotly.graph_objects as go
 from sam_config import sam_status
 from sam_leaf_segment import segment_leaf, segment_from_boxes, analyze_disease_extent
 from multimodal_api import ask_multimodal, call_vision_api, MODELS, DEFAULT_API_KEY
-from mosaic_analyzer import analyze_mosaic
 
 # --------------------------------------------------------------------------------
 # 全局配置与状态
 # --------------------------------------------------------------------------------
 ROOT = Path(__file__).parent
 DATA_YAML = str(ROOT / "datasets" / "data.yaml")
+# Ultralytics 默认训练输出根；误写成 runs/detect/runs/detect/... 时也会被下方 rglob 扫到
+RUNS_DETECT_DIR = ROOT / "runs" / "detect"
+# 诊断页 Plotly 图默认高度参考（条形图/空图等）
+DIAGNOSIS_PLOTLY_HEIGHT = 480
+# 与 datasets/data.yaml 中 names 一致；未命中时界面仍显示英文类名
+DISEASE_NAME_ZH = {
+    "Rust": "锈病",
+    "Mosaic": "花叶病",
+    "Grey_spot": "灰斑病",
+    "Brown_Spot": "褐斑病",
+    "Alternaria_Boltch": "链格孢叶斑病",
+}
+
+
+def _disease_display_name(en_key: str) -> str:
+    """用于图上文字：中文（英文键）。"""
+    zh = DISEASE_NAME_ZH.get(en_key)
+    if zh:
+        return f"{zh} ({en_key})"
+    return str(en_key)
+
+
+def _disease_cn_only(en_key: str) -> str:
+    return DISEASE_NAME_ZH.get(en_key, en_key)
 
 
 def _extract_base_model_tag(base_weight):
@@ -56,34 +79,42 @@ def _display_run_name(run_name, base_weight):
         return f"train_{tag}"
     return run_name
 
-# 扫描已训练模型
+# 扫描已训练模型（递归 runs/detect，兼容误嵌套的 runs/detect/runs/detect/...）
 def _scan_trained_models():
     options = []
-    search_roots = [
-        ROOT / "runs" / "detect",
-    ]
-    for base in search_roots:
-        if not base.exists(): continue
-        # 搜索所有 weights/best.pt
-        for weights in sorted(base.glob("*/weights/best.pt")):
-            run_dir = weights.parent.parent
-            run_name = run_dir.name
-            base_weight = ""
-            args_path = run_dir / "args.yaml"
-            if args_path.exists():
-                try:
-                    with open(args_path, "r", encoding="utf-8", errors="ignore") as f:
-                        for line in f:
-                            s = line.strip()
-                            if s.startswith("model:"):
-                                base_weight = s.split(":", 1)[1].strip().strip("'").strip('"')
-                                break
-                except Exception:
-                    base_weight = ""
-            display_name = _display_run_name(run_name, base_weight)
-            options.append((display_name, str(weights)))
-    
+    base = RUNS_DETECT_DIR
+    if not base.is_dir():
+        return options
+    seen = set()
+    for weights in sorted(base.rglob("weights/best.pt")):
+        try:
+            key = str(weights.resolve())
+        except Exception:
+            key = str(weights)
+        if key in seen:
+            continue
+        seen.add(key)
+        run_dir = weights.parent.parent
+        run_name = run_dir.name
+        base_weight = ""
+        args_path = run_dir / "args.yaml"
+        if args_path.exists():
+            try:
+                with open(args_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s.startswith("model:"):
+                            base_weight = s.split(":", 1)[1].strip().strip("'").strip('"')
+                            break
+            except Exception:
+                base_weight = ""
+        display_name = _display_run_name(run_name, base_weight)
+        options.append((display_name, str(weights)))
+
+    # 新训练在上：按权重文件修改时间倒序
+    options.sort(key=lambda t: Path(t[1]).stat().st_mtime, reverse=True)
     return options
+
 
 MODEL_OPTIONS = _scan_trained_models()
 
@@ -151,18 +182,34 @@ def _model_fixed_color(model_name, base_weight, fallback_palette, fallback_idx):
         return "#3B82F6"  # blue
     if "11m" in text or "yolo11m" in text:
         return "#F59E0B"  # yellow/orange
+    if "v8m" in text or "yolov8m" in text:
+        return "#A855F7"  # purple
     return fallback_palette[fallback_idx % len(fallback_palette)]
 
 
 def _collect_training_run_dirs():
-    train_root = ROOT / "runs" / "detect"
-    if not train_root.exists():
+    if not RUNS_DETECT_DIR.is_dir():
         return []
-    runs = []
-    for run_dir in sorted(train_root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if run_dir.is_dir() and (run_dir / "results.csv").exists():
-            runs.append(run_dir)
-    return runs
+    seen = set()
+    rows = []
+    for csv_path in RUNS_DETECT_DIR.rglob("results.csv"):
+        run_dir = csv_path.parent
+        if not run_dir.is_dir():
+            continue
+        try:
+            key = str(run_dir.resolve())
+        except Exception:
+            key = str(run_dir)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            mtime = run_dir.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        rows.append((mtime, run_dir))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    return [r[1] for r in rows]
 
 
 def _resolve_val_image_paths(sample_count=100):
@@ -249,7 +296,7 @@ def _resolve_val_image_paths(sample_count=100):
 def benchmark_model_inference(device, imgsz, conf, sample_count, warmup_count):
     run_dirs = _collect_training_run_dirs()
     if not run_dirs:
-        return "⚠️ 未找到可测速模型（runs/detect/*/results.csv）"
+        return "⚠️ 未找到可测速模型（需在 runs/detect 下任意层级的 results.csv）"
 
     image_paths = _resolve_val_image_paths(sample_count=sample_count)
     if not image_paths:
@@ -337,59 +384,6 @@ def benchmark_model_inference(device, imgsz, conf, sample_count, warmup_count):
     return f"✅ 识别测速完成：成功 {updated} 个模型，失败 {failed} 个模型（样本 {sample_count} 张，设备 {device_str}）"
 
 
-_PRISM_I = [7, 0, 0, 0, 4, 4, 6, 6, 4, 0, 3, 2]
-_PRISM_J = [3, 4, 1, 2, 5, 6, 5, 2, 0, 1, 6, 3]
-_PRISM_K = [0, 7, 2, 3, 6, 7, 1, 1, 5, 5, 7, 6]
-
-
-def _add_prism(fig, x_center, y_center, width, depth, height, color, hover_text, name):
-    x0, x1 = x_center - width / 2.0, x_center + width / 2.0
-    y0, y1 = y_center - depth / 2.0, y_center + depth / 2.0
-    z0, z1 = 0.0, max(height, 0.0)
-
-    vx = [x0, x0, x1, x1, x0, x0, x1, x1]
-    vy = [y0, y1, y1, y0, y0, y1, y1, y0]
-    vz = [z0, z0, z0, z0, z1, z1, z1, z1]
-
-    fig.add_trace(go.Mesh3d(
-        x=vx,
-        y=vy,
-        z=vz,
-        i=_PRISM_I,
-        j=_PRISM_J,
-        k=_PRISM_K,
-        color=color,
-        opacity=0.94,
-        flatshading=True,
-        name=name,
-        showlegend=False,
-        hovertext=hover_text,
-        hoverinfo="text",
-        lighting=dict(ambient=0.35, diffuse=0.88, specular=0.7, roughness=0.25, fresnel=0.2),
-        lightposition=dict(x=110, y=-140, z=180),
-    ))
-
-    edges = [
-        (0, 1), (1, 2), (2, 3), (3, 0),
-        (4, 5), (5, 6), (6, 7), (7, 4),
-        (0, 4), (1, 5), (2, 6), (3, 7),
-    ]
-    xe, ye, ze = [], [], []
-    for a, b in edges:
-        xe.extend([vx[a], vx[b], None])
-        ye.extend([vy[a], vy[b], None])
-        ze.extend([vz[a], vz[b], None])
-    fig.add_trace(go.Scatter3d(
-        x=xe,
-        y=ye,
-        z=ze,
-        mode="lines",
-        line=dict(color="rgba(255,255,255,0.35)", width=3),
-        hoverinfo="skip",
-        showlegend=False,
-    ))
-
-
 def _apply_3d_scene(fig, title_text, x_title, y_title, z_title, x_range=None, y_range=None, z_range=None):
     fig.update_layout(
         scene=dict(
@@ -432,181 +426,274 @@ def _apply_3d_scene(fig, title_text, x_title, y_title, z_title, x_range=None, y_
         font=dict(color="#0f172a")
     )
 
-def _build_disease_profile_3d(detections, disease_areas, disease_conf_sum, disease_conf_count, disease_centers, image_shape):
-    fig = go.Figure()
-    metric_names = ["框数", "面积占比", "均值置信", "空间离散", "中心偏移"]
-    angles = np.linspace(0, 2 * np.pi, len(metric_names), endpoint=False)
-    max_radius = 58.0
-    palette = ["#34D399", "#F59E0B", "#60A5FA", "#F472B6", "#22D3EE", "#A3E635", "#FB7185"]
 
+def _hide_3d_scene_axes(fig):
+    """与模型多维画像一致：不显示 Plotly 默认的 XYZ 轴刻度与网格，仅保留自定义几何与文字。"""
+    fig.update_scenes(
+        xaxis_showticklabels=False,
+        xaxis_ticks="",
+        xaxis_showgrid=False,
+        xaxis_zeroline=False,
+        yaxis_showticklabels=False,
+        yaxis_ticks="",
+        yaxis_showgrid=False,
+        yaxis_zeroline=False,
+        zaxis_showticklabels=False,
+        zaxis_ticks="",
+        zaxis_showgrid=False,
+        zaxis_zeroline=False,
+    )
+
+
+# 未启用 SAM 时与旧版 3D 雷达一致的占位辐条刻度（条形图横轴 0～1）
+_SAM_METRIC_PLACEHOLDER = 0.38
+
+
+def _collect_disease_metric_rows(
+    detections: dict,
+    disease_conf_sum: dict,
+    disease_conf_count: dict,
+    sam_profile: dict | None,
+) -> list[dict]:
     if not detections:
-        fig.add_trace(go.Scatter3d(
-            x=[0], y=[0], z=[0],
-            mode="markers+text",
-            marker=dict(size=10, color="#A1A1AA"),
-            text=["暂无病害数据"],
-            textposition="top center",
-            hoverinfo="skip",
-            showlegend=False,
-        ))
-        _apply_3d_scene(
-            fig,
-            "病害多维画像",
-            "维度 X",
-            "维度 Y",
-            "病害层",
-            x_range=[-65, 65],
-            y_range=[-65, 65],
-            z_range=[0, 40],
-        )
-        return fig
-
-    h, w = image_shape[:2]
-    image_area = max(1.0, float(h * w))
+        return []
     max_count = max(detections.values()) if detections else 1
-    layer_gap = 28.0
-
-    # 仅绘制一套基准轴/基准环，减少杂讯
-    for ring_pct in [25, 50, 75, 100]:
-        rr = (ring_pct / 100.0) * max_radius
-        rx = [rr * np.cos(a) for a in angles] + [rr * np.cos(angles[0])]
-        ry = [rr * np.sin(a) for a in angles] + [rr * np.sin(angles[0])]
-        rz = [0.0] * (len(angles) + 1)
-        fig.add_trace(go.Scatter3d(
-            x=rx, y=ry, z=rz,
-            mode="lines",
-            line=dict(color="rgba(180,190,205,0.20)", width=2),
-            hoverinfo="skip",
-            showlegend=False,
-        ))
-
-    for axis_idx, axis_name in enumerate(metric_names):
-        ax = max_radius * np.cos(angles[axis_idx])
-        ay = max_radius * np.sin(angles[axis_idx])
-        fig.add_trace(go.Scatter3d(
-            x=[0, ax], y=[0, ay], z=[0, 0],
-            mode="lines+text",
-            line=dict(color="rgba(210,220,230,0.35)", width=4),
-            text=["", axis_name],
-            textposition="top center",
-            textfont=dict(size=14, color="#0f172a"),
-            hoverinfo="skip",
-            showlegend=False,
-        ))
-
+    leaf_frame = float((sam_profile or {}).get("leaf_frame_confidence", 0.42))
+    by_dis = (sam_profile or {}).get("by_disease") or {}
+    active = bool(sam_profile)
+    rows: list[dict] = []
     ordered = sorted(detections.items(), key=lambda x: x[1], reverse=True)
-    for idx, (disease, count) in enumerate(ordered):
-        area = disease_areas.get(disease, 0.0)
-        area_ratio = min(1.0, area / image_area)
+    ph = _SAM_METRIC_PLACEHOLDER
+    for disease, count in ordered:
         conf_mean = 0.0
         if disease_conf_count.get(disease, 0) > 0:
             conf_mean = disease_conf_sum.get(disease, 0.0) / max(disease_conf_count[disease], 1)
         conf_mean = min(max(conf_mean, 0.0), 1.0)
-
-        centers = disease_centers.get(disease, [])
-        if centers:
-            c = np.array(centers, dtype=float)
-            center_mean = c.mean(axis=0)
-            d = np.sqrt(np.sum((c - center_mean) ** 2, axis=1))
-            dispersion = min(1.0, float(d.mean()) / 0.35)
-            center_bias = min(1.0, float(np.sqrt(((center_mean - np.array([0.5, 0.5])) ** 2).sum()) / 0.70710678))
+        if active:
+            dm = by_dis.get(disease, {}) or {}
+            raw_lr = float(dm.get("leaf_lesion_ratio", 0.0))
+            raw_lr = min(1.0, max(0.0, raw_lr))
+            box_cons = float(dm.get("box_mask_consistency", 0.0))
+            box_cons = min(1.0, max(0.0, box_cons))
+            lf = min(1.0, max(0.0, leaf_frame))
+            bar_lr, bar_lf, bar_bc = raw_lr, lf, box_cons
         else:
-            dispersion = 0.0
-            center_bias = 0.0
-
-        metrics = [
-            min(1.0, count / max(max_count, 1)),
-            area_ratio,
-            conf_mean,
-            dispersion,
-            center_bias,
-        ]
-        metrics_pct = [m * 100.0 for m in metrics]
-
-        z_layer = idx * layer_gap
-        color = palette[idx % len(palette)]
-
-        px = [metrics[i] * max_radius * np.cos(angles[i]) for i in range(len(metric_names))]
-        py = [metrics[i] * max_radius * np.sin(angles[i]) for i in range(len(metric_names))]
-        pz = [z_layer] * len(metric_names)
-
-        # 面填充：中心点 + 各顶点，使用三角扇方式
-        vx = [0.0] + px
-        vy = [0.0] + py
-        vz = [z_layer] + pz
-        i_idx, j_idx, k_idx = [], [], []
-        for p in range(1, len(metric_names) + 1):
-            q = p + 1 if p < len(metric_names) else 1
-            i_idx.append(0)
-            j_idx.append(p)
-            k_idx.append(q)
-
-        hover_text = (
-            f"<b>{disease}</b><br>"
-            f"框数: {count}<br>"
-            f"面积占比: {metrics_pct[1]:.1f}%<br>"
-            f"均值置信: {metrics_pct[2]:.1f}%<br>"
-            f"空间离散: {metrics_pct[3]:.1f}%<br>"
-            f"中心偏移: {metrics_pct[4]:.1f}%"
+            raw_lr = 0.0
+            box_cons = 0.0
+            lf = 0.0
+            bar_lr, bar_lf, bar_bc = ph, ph, ph
+        rows.append(
+            {
+                "disease": disease,
+                "display": _disease_display_name(disease),
+                "count": int(count),
+                "count_norm": min(1.0, count / max(max_count, 1)),
+                "conf_mean": conf_mean,
+                "raw_leaf_ratio": raw_lr,
+                "leaf_frame": lf,
+                "box_cons": box_cons,
+                "bar_leaf_ratio": bar_lr,
+                "bar_leaf_frame": bar_lf,
+                "bar_box_cons": bar_bc,
+                "sam_active": active,
+            }
         )
-        fig.add_trace(go.Mesh3d(
-            x=vx, y=vy, z=vz,
-            i=i_idx, j=j_idx, k=k_idx,
-            color=color,
-            opacity=0.32,
-            flatshading=True,
-            hovertext=hover_text,
-            hoverinfo="text",
-            showlegend=False,
-            lighting=dict(ambient=0.42, diffuse=0.8, specular=0.45, roughness=0.35),
-            lightposition=dict(x=90, y=-110, z=140),
-        ))
+    return rows
 
-        px_closed = px + [px[0]]
-        py_closed = py + [py[0]]
-        pz_closed = pz + [pz[0]]
-        fig.add_trace(go.Scatter3d(
-            x=px_closed,
-            y=py_closed,
-            z=pz_closed,
-            mode="lines+markers",
-            marker=dict(size=4.5, color=color, opacity=0.95),
-            line=dict(color=color, width=6),
-            hovertext=[f"{disease} - {metric_names[i % len(metric_names)]}: {metrics_pct[i % len(metric_names)]:.1f}%" for i in range(len(px_closed))],
-            hoverinfo="text",
-            showlegend=False,
-        ))
 
-        fig.add_trace(go.Scatter3d(
-            x=[0], y=[0], z=[z_layer],
-            mode="text",
-            text=[disease],
-            textfont=dict(size=13, color="#0f172a"),
-            hoverinfo="skip",
-            showlegend=False,
-        ))
+# 诊断页条形图：白底 + 黑字
+_METRICS_CHART_TEXT = "#0f172a"
+_METRICS_CHART_BG = "#ffffff"
+# 量化指标 HTML 区
+_METRICS_HTML_TEXT = "#0f172a"
+_METRICS_HTML_MUTED = "#334155"
+_METRICS_HTML_CARD_BG = "#f8fafc"
 
-    _apply_3d_scene(
-        fig,
-        "病害多维画像",
-        "多维投影 X",
-        "多维投影 Y",
-        "病害层",
-        x_range=[-65, 65],
-        y_range=[-65, 65],
-        z_range=[-5, max(10.0, (len(ordered) - 1) * layer_gap + 16)],
+
+def _wrap_metrics_html(inner: str) -> str:
+    """量化指标 HTML：统一白底黑字容器。"""
+    return (
+        f'<div class="metrics-html-zone" style="background:#ffffff;color:{_METRICS_HTML_TEXT};'
+        "border:1px solid #e2e8f0;border-radius:8px;padding:12px 14px;"
+        'margin-top:8px;line-height:1.55;font-size:0.95rem;">'
+        f"{inner}</div>"
     )
-    fig.update_layout(font=dict(color="#0f172a"), height=640)
+
+
+def _metrics_html_placeholder(message: str) -> str:
+    return _wrap_metrics_html(f'<p style="margin:0;color:{_METRICS_HTML_TEXT};">{message}</p>')
+
+
+def _empty_disease_metrics_fig(message: str = "暂无数据") -> go.Figure:
+    fig = go.Figure()
+    fig.add_annotation(
+        x=0.5,
+        y=0.5,
+        xref="paper",
+        yref="paper",
+        text=message,
+        showarrow=False,
+        font=dict(size=15, color=_METRICS_CHART_TEXT),
+    )
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    fig.update_layout(
+        height=max(220, int(DIAGNOSIS_PLOTLY_HEIGHT * 0.45)),
+        margin=dict(l=16, r=16, t=28, b=16),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor=_METRICS_CHART_BG,
+        font=dict(color=_METRICS_CHART_TEXT),
+    )
+    return fig
+
+
+def _build_disease_metrics_card_html(rows: list[dict]) -> str:
+    if not rows:
+        return _metrics_html_placeholder("尚无检出或指标。")
+    parts = [
+        f'<div style="display:flex;flex-wrap:wrap;gap:10px;color:{_METRICS_HTML_TEXT};">'
+    ]
+    for r in rows:
+        if r["sam_active"]:
+            lr_txt = f'{r["raw_leaf_ratio"]*100:.1f}%'
+            lf_txt = f'{r["leaf_frame"]*100:.0f}/100'
+            bc_txt = f'{r["box_cons"]*100:.1f}%'
+        else:
+            lr_txt = "占位"
+            lf_txt = "占位"
+            bc_txt = "占位"
+        parts.append(
+            f'<div style="flex:1;min-width:120px;border:1px solid #e2e8f0;border-radius:8px;'
+            f'padding:10px 12px;background:{_METRICS_HTML_CARD_BG};">'
+            f'<div style="font-weight:700;color:{_METRICS_HTML_TEXT};margin-bottom:4px;font-size:1rem;">{r["display"]}</div>'
+            f'<div style="font-size:0.9rem;color:{_METRICS_HTML_MUTED};">框数 <b style="color:{_METRICS_HTML_TEXT}">{r["count"]}</b> · '
+            f'置信均值 <b style="color:{_METRICS_HTML_TEXT}">{r["conf_mean"]*100:.1f}%</b></div>'
+            f'<div style="font-size:0.88rem;color:{_METRICS_HTML_MUTED};margin-top:6px;line-height:1.45;">'
+            f"叶内病斑 {lr_txt} · 取景 {lf_txt} · 框-掩膜 {bc_txt}</div>"
+            "</div>"
+        )
+    parts.append("</div>")
+    return _wrap_metrics_html("".join(parts))
+
+
+def _build_disease_metrics_bar_figure(rows: list[dict]) -> go.Figure:
+    from plotly.subplots import make_subplots
+
+    if not rows:
+        return _empty_disease_metrics_fig()
+    metric_labels = ["框数(归一化)", "置信度均值", "叶内病斑比", "叶片取景", "框-掩膜一致"]
+    n = len(rows)
+    titles = [r["display"] for r in rows]
+    fig = make_subplots(
+        rows=n,
+        cols=1,
+        subplot_titles=titles,
+        vertical_spacing=min(0.11, 0.06 + 0.02 * max(0, 4 - n)),
+    )
+    colors = ["#34D399", "#60A5FA", "#F472B6", "#F59E0B", "#A78BFA"]
+    for i, r in enumerate(rows, start=1):
+        xs = [
+            r["count_norm"],
+            r["conf_mean"],
+            r["bar_leaf_ratio"],
+            r["bar_leaf_frame"],
+            r["bar_box_cons"],
+        ]
+        raw_lr = r["raw_leaf_ratio"]
+        active = r["sam_active"]
+        hover = [
+            f"框数: {r['count']}（相对本图最大类归一化）",
+            f"置信度均值: {r['conf_mean']*100:.1f}%",
+            (
+                f"叶内病斑面积比: {raw_lr*100:.1f}%"
+                if active
+                else f"未启用 SAM：叶内病斑比为占位刻度（{_SAM_METRIC_PLACEHOLDER*100:.0f}%）"
+            ),
+            (
+                f"叶片取景分: {r['leaf_frame']*100:.0f}/100"
+                if active
+                else "未启用 SAM：取景为占位刻度"
+            ),
+            (
+                f"框掩膜一致性: {r['box_cons']*100:.1f}%"
+                if active
+                else f"未启用 SAM：框-掩膜为占位刻度（{_SAM_METRIC_PLACEHOLDER*100:.0f}%）"
+            ),
+        ]
+        texts = []
+        for j, v in enumerate(xs):
+            if j == 3:
+                texts.append(f"{v*100:.0f}/100")
+            else:
+                texts.append(f"{v*100:.0f}%")
+        fig.add_trace(
+            go.Bar(
+                x=xs,
+                y=metric_labels,
+                orientation="h",
+                marker_color=colors,
+                text=texts,
+                textposition="outside",
+                textfont=dict(size=11, color=_METRICS_CHART_TEXT),
+                hovertext=hover,
+                hoverinfo="text",
+            ),
+            row=i,
+            col=1,
+        )
+        fig.update_xaxes(
+            range=[0, 1.08],
+            tickformat=".0%",
+            row=i,
+            col=1,
+            gridcolor="rgba(15,23,42,0.12)",
+            zeroline=False,
+            tickfont=dict(color=_METRICS_CHART_TEXT, size=11),
+        )
+        fig.update_yaxes(
+            row=i,
+            col=1,
+            tickfont=dict(color=_METRICS_CHART_TEXT, size=12),
+        )
+    h = int(min(max(240, 72 + 128 * n), 560))
+    fig.update_layout(
+        height=h,
+        showlegend=False,
+        paper_bgcolor="#ffffff",
+        plot_bgcolor=_METRICS_CHART_BG,
+        font=dict(color=_METRICS_CHART_TEXT, size=12),
+        margin=dict(l=6, r=48, t=40 + 12 * n, b=20),
+        title=dict(
+            text="<b>各类病害 · 指标条形</b>",
+            font=dict(size=15, color=_METRICS_CHART_TEXT),
+        ),
+        hoverlabel=dict(
+            font=dict(size=12, color=_METRICS_CHART_TEXT),
+            bgcolor="#ffffff",
+            bordercolor="rgba(15,23,42,0.2)",
+        ),
+    )
+    fig.update_annotations(font=dict(color=_METRICS_CHART_TEXT, size=13))
     return fig
 
 
 def _build_model_profile_3d(records):
     fig = go.Figure()
-    metric_names = ["mAP50", "mAP50-95", "Precision", "Recall", "识别速度得分", "参数规模得分", "综合效率"]
+    metric_names = [
+        "mAP50",
+        "mAP50-95",
+        "精确率 (Precision)",
+        "召回率 (Recall)",
+        "识别速度得分",
+        "部署成本得分",
+        "综合效率",
+    ]
     # 明确起点：从左上方向开始，顺时针排布
     start_angle = np.deg2rad(125.0)
     angles = np.linspace(start_angle, start_angle - 2 * np.pi, len(metric_names), endpoint=False)
     max_radius = 200.0
+    # 轴名单独画在轮辐末端之外：系数越大，轴名离多边形（100% 环）越远；与 scene range 配合避免裁切
+    axis_label_radius_factor = 1.32
     layer_gap = 24.0
     fallback_palette = ["#EC4899", "#14B8A6", "#8B5CF6", "#EF4444", "#06B6D4", "#A3E635", "#F97316"]
 
@@ -657,13 +744,22 @@ def _build_model_profile_3d(records):
         ))
 
     for axis_idx, axis_name in enumerate(metric_names):
-        ax = max_radius * np.cos(angles[axis_idx])
-        ay = max_radius * np.sin(angles[axis_idx])
+        c, s = np.cos(angles[axis_idx]), np.sin(angles[axis_idx])
+        ax = max_radius * c
+        ay = max_radius * s
+        lx = max_radius * axis_label_radius_factor * c
+        ly = max_radius * axis_label_radius_factor * s
         fig.add_trace(go.Scatter3d(
             x=[0, ax], y=[0, ay], z=[0, 0],
-            mode="lines+text",
+            mode="lines",
             line=dict(color="rgba(210,220,230,0.34)", width=3),
-            text=["", axis_name],
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+        fig.add_trace(go.Scatter3d(
+            x=[lx], y=[ly], z=[0.0],
+            mode="text",
+            text=[axis_name],
             textposition="top center",
             textfont=dict(size=12, color="#0f172a"),
             hoverinfo="skip",
@@ -680,7 +776,7 @@ def _build_model_profile_3d(records):
         lambda r: min(max(r.get("precision", 0.0), 0.0), 1.0),
         lambda r: min(max(r.get("recall", 0.0), 0.0), 1.0),
         lambda r: min(max(r.get("speed_score", 0.0), 0.0), 1.0),
-        lambda r: min(max(r.get("param_scale_score", 0.0), 0.0), 1.0),
+        lambda r: min(max(r.get("deploy_cost_score", 0.0), 0.0), 1.0),
         lambda r: min(max(r.get("efficiency_score", 0.0), 0.0), 1.0),
     ]
     raw_metric_rows = [[getter(rec) for getter in metric_getters] for rec in ordered]
@@ -739,12 +835,12 @@ def _build_model_profile_3d(records):
             f"基线: {rec['base_weight']}<br>"
             f"mAP50: {metrics_pct[0]:.1f}%<br>"
             f"mAP50-95: {metrics_pct[1]:.1f}%<br>"
-            f"Precision: {metrics_pct[2]:.1f}%<br>"
-            f"Recall: {metrics_pct[3]:.1f}%<br>"
+            f"精确率 (Precision): {metrics_pct[2]:.1f}%<br>"
+            f"召回率 (Recall): {metrics_pct[3]:.1f}%<br>"
             f"推理总耗时: {rec.get('infer_total_ms', 0.0):.2f} ms<br>"
             f"FPS: {rec.get('fps', 0.0):.2f}<br>"
             f"识别速度得分: {metrics_pct[4]:.1f}%<br>"
-            f"参数规模得分: {metrics_pct[5]:.1f}%<br>"
+            f"部署成本得分: {metrics_pct[5]:.1f}%<br>"
             f"综合效率: {metrics_pct[6]:.1f}%"
         )
         fig.add_trace(go.Mesh3d(
@@ -790,26 +886,16 @@ def _build_model_profile_3d(records):
         "",
         "",
         "",
-        x_range=[-(max_radius + 70.0), (max_radius + 70.0)],
-        y_range=[-(max_radius + 60.0), (max_radius + 60.0)],
+        x_range=[-(max_radius + 100.0), (max_radius + 100.0)],
+        y_range=[-(max_radius + 92.0), (max_radius + 92.0)],
         z_range=[0, max(30.0, len(ordered) * layer_gap + 34.0)],
     )
-    fig.update_layout(scene_camera=dict(eye=dict(x=2.45, y=1.95, z=1.70)))
-    # 去掉 XYZ 刻度与网格，避免干扰多维环刻度阅读
-    fig.update_scenes(
-        xaxis_showticklabels=False,
-        xaxis_ticks="",
-        xaxis_showgrid=False,
-        xaxis_zeroline=False,
-        yaxis_showticklabels=False,
-        yaxis_ticks="",
-        yaxis_showgrid=False,
-        yaxis_zeroline=False,
-        zaxis_showticklabels=False,
-        zaxis_ticks="",
-        zaxis_showgrid=False,
-        zaxis_zeroline=False,
+    fig.update_layout(
+        scene_camera=dict(eye=dict(x=2.45, y=1.95, z=1.70)),
+        margin=dict(l=20, r=20, b=22, t=48),
     )
+    # 去掉 XYZ 刻度与网格，避免干扰多维环刻度阅读
+    _hide_3d_scene_axes(fig)
     fig.update_layout(font=dict(color="#0f172a"))
     return fig
 
@@ -885,7 +971,7 @@ def refresh_model_metrics():
 
     # 归一化分数：
     # 1) 识别速度得分：mean_total_ms 越低得分越高（来自 benchmark）
-    # 2) 参数规模得分：参数量越大得分越高
+    # 2) 部署成本得分：参数量越小越好；在 log10(M) 上做 min-max 再取反，避免 2M vs 68M 线性刻度把中间档全压扁
     if records:
         speed_values = [r["infer_total_ms"] for r in records if r["infer_total_ms"] > 0]
         if speed_values:
@@ -893,11 +979,15 @@ def refresh_model_metrics():
         else:
             t_min, t_max = 0.0, 0.0
 
-        param_values = [r["params_m"] for r in records if r["params_m"] is not None]
-        if param_values:
-            p_min, p_max = min(param_values), max(param_values)
+        logp_vals = []
+        for r in records:
+            pm = r["params_m"]
+            if pm is not None and pm > 0:
+                logp_vals.append(math.log10(pm))
+        if logp_vals:
+            lp_min, lp_max = min(logp_vals), max(logp_vals)
         else:
-            p_min, p_max = 0.0, 0.0
+            lp_min, lp_max = 0.0, 0.0
 
         for rec in records:
             t = rec["infer_total_ms"]
@@ -909,23 +999,24 @@ def refresh_model_metrics():
                 speed_score = 0.5
 
             p = rec["params_m"]
-            if p is not None and p_max > p_min:
-                param_scale_score = (p - p_min) / (p_max - p_min)
-            elif p is not None:
-                param_scale_score = 1.0
+            if p is not None and p > 0 and lp_max > lp_min:
+                lp = math.log10(p)
+                deploy_cost_score = (lp_max - lp) / (lp_max - lp_min)
+            elif p is not None and p > 0:
+                deploy_cost_score = 1.0
             else:
-                param_scale_score = 0.5
+                deploy_cost_score = 0.5
 
-            # 综合效率：准确率主导 + 训练速度 + 参数规模
+            # 综合效率：准确率主导 + 推理速度 + 部署成本（轻量更占优）
             efficiency_score = (
                 rec["map50_95"] * 0.45
                 + rec["precision"] * 0.20
                 + rec["recall"] * 0.15
                 + speed_score * 0.12
-                + param_scale_score * 0.08
+                + deploy_cost_score * 0.08
             )
             rec["speed_score"] = float(min(max(speed_score, 0.0), 1.0))
-            rec["param_scale_score"] = float(min(max(param_scale_score, 0.0), 1.0))
+            rec["deploy_cost_score"] = float(min(max(deploy_cost_score, 0.0), 1.0))
             rec["efficiency_score"] = float(min(max(efficiency_score, 0.0), 1.0))
 
     table_rows = [
@@ -947,7 +1038,7 @@ def refresh_model_metrics():
             rec["bench_samples"] if rec["bench_samples"] > 0 else "-",
             round(rec["params_m"], 2) if rec["params_m"] is not None else "-",
             round(rec.get("speed_score", 0.5), 4),
-            round(rec.get("param_scale_score", 0.5), 4),
+            round(rec.get("deploy_cost_score", 0.5), 4),
             round(rec.get("efficiency_score", 0.0), 4),
         ]
         for rec in records
@@ -956,19 +1047,33 @@ def refresh_model_metrics():
     fig = _build_model_profile_3d(records)
     return table_rows, fig
 
+
+def refresh_training_dashboard():
+    """刷新检测页「模型」下拉 + 评估表与 3D 多维画像（会递归扫描 runs/detect）。"""
+    global MODEL_OPTIONS
+    MODEL_OPTIONS = _scan_trained_models()
+    rows, fig = refresh_model_metrics()
+    names = [o[0] for o in MODEL_OPTIONS]
+    return gr.update(choices=names, value=names[0] if names else None), rows, fig
+
+
 # --------------------------------------------------------------------------------
 # 核心预测逻辑
 # --------------------------------------------------------------------------------
 def smart_diagnosis(image, model_choice, conf_threshold, use_sam, sam_model, sam_device, use_ai, api_key, ai_model):
     """
-    一站式诊断：流式输出版 (YOLO -> SAM -> 3D -> AI)
+    一站式诊断：流式输出 (YOLO -> SAM -> 病害量化指标卡/条形图 -> AI)
     """
+    empty_metrics_html = _metrics_html_placeholder("请先上传图片")
     if image is None:
-        fig = go.Figure()
-        fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        profile_fig = go.Figure()
-        profile_fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        yield None, None, "请上传一张叶片图片", "请上传图片后重试", fig, profile_fig
+        yield (
+            None,
+            None,
+            "请上传一张叶片图片",
+            empty_metrics_html,
+            _empty_disease_metrics_fig("请先上传图片"),
+            "请上传图片后重试",
+        )
         return
 
     # 初始化所有返回值，作为初始流输出
@@ -976,8 +1081,8 @@ def smart_diagnosis(image, model_choice, conf_threshold, use_sam, sam_model, sam
     analysis_img = None
     stats_info = "⌛ 正在启动推理引擎..."
     ai_suggestion = "等待中..."
-    fig = go.Figure()
-    profile_fig = go.Figure()
+    metrics_html = _metrics_html_placeholder("等待中…")
+    metrics_fig = _empty_disease_metrics_fig("等待诊断")
 
     try:
         # 1. 释放显存
@@ -987,8 +1092,32 @@ def smart_diagnosis(image, model_choice, conf_threshold, use_sam, sam_model, sam
                 torch.cuda.empty_cache()
         except: pass
 
-        # 2. YOLO 检测 (秒开)
-        model_path = MODEL_OPTIONS[model_choice][1] if isinstance(model_choice, int) else model_choice
+        opts = _scan_trained_models()
+        if not opts:
+            yield (
+                None,
+                None,
+                "⚠️ 未找到训练权重。请将训练输出放在 runs/detect/<保存名称>/weights/best.pt（避免 runs/detect/runs/detect 重复嵌套）。",
+                _metrics_html_placeholder("当前无可用模型权重。"),
+                _empty_disease_metrics_fig("无权重"),
+                "请完成训练或检查路径后重试",
+            )
+            return
+        if isinstance(model_choice, int):
+            idx = max(0, min(int(model_choice), len(opts) - 1))
+            model_path = opts[idx][1]
+        else:
+            model_path = None
+            if model_choice is not None:
+                choice_str = str(model_choice).strip()
+                for name, wpath in opts:
+                    if name == choice_str:
+                        model_path = wpath
+                        break
+                if model_path is None and choice_str.endswith(".pt"):
+                    model_path = choice_str
+            if model_path is None and opts:
+                model_path = opts[0][1]
         model = YOLO(model_path)
         img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         results = model.predict(source=img_bgr, imgsz=512, conf=conf_threshold, verbose=False)
@@ -997,161 +1126,131 @@ def smart_diagnosis(image, model_choice, conf_threshold, use_sam, sam_model, sam
         
         boxes = results[0].boxes
         detections = {}
-        disease_areas = {}
         disease_conf_sum = {}
         disease_conf_count = {}
-        disease_centers = {}
-        
+        box_class_names_list: list[str] = []
+
         if boxes is not None and len(boxes) > 0:
             # 关键修复：一次性将所有检测结果转为 CPU 上的 Python 类型，避免后续混入 Tensor
             cls_ids = boxes.cls.cpu().tolist()
             confs = boxes.conf.cpu().tolist()
             xyxy_list = boxes.xyxy.cpu().tolist()
-            
+
             for i, cls_id in enumerate(cls_ids):
                 name = model.names[int(cls_id)]
+                box_class_names_list.append(name)
                 detections[name] = detections.get(name, 0) + 1
-                
-                box = xyxy_list[i] # 这是一个包含 4 个 float 的列表
-                area = (box[2] - box[0]) * (box[3] - box[1])
-                disease_areas[name] = disease_areas.get(name, 0) + float(area)
-                
+
                 conf = float(confs[i])
                 disease_conf_sum[name] = disease_conf_sum.get(name, 0.0) + conf
                 disease_conf_count[name] = disease_conf_count.get(name, 0) + 1
-                
-                ih, iw = image.shape[:2]
-                cx = ((box[0] + box[2]) * 0.5) / iw
-                cy = ((box[1] + box[3]) * 0.5) / ih
-                disease_centers.setdefault(name, []).append((cx, cy))
             
-            stats_info = "✅ YOLO 已完成定位\n" + "\n".join([f"  • {k}: {v} 处" for k, v in detections.items()])
+            stats_info = "✅ YOLO 已完成定位\n" + "\n".join(
+                [f"  • {_disease_display_name(k)}: {v} 处" for k, v in detections.items()]
+            )
         else:
             stats_info = "⚪ 未检出病斑"
             ai_suggestion = "叶片表现健康，建议定期观察。"
 
-        # 【第一次输出】：用户能立刻看到带框的图和文字统计
-        yield yolo_plot_rgb, analysis_img, stats_info, ai_suggestion, fig, profile_fig
+        sam_profile = None
+        if detections:
+            m_rows = _collect_disease_metric_rows(
+                detections, disease_conf_sum, disease_conf_count, sam_profile
+            )
+            metrics_html = _build_disease_metrics_card_html(m_rows)
+            metrics_fig = _build_disease_metrics_bar_figure(m_rows)
+        else:
+            metrics_html = _build_disease_metrics_card_html([])
+            metrics_fig = _build_disease_metrics_bar_figure([])
+
+        # 【第一次输出】：用户能立刻看到带框的图、文字统计与指标（SAM 前为占位）
+        yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
 
         # 3. 如果开启 SAM 面积分析 (稍慢)
         if boxes is not None and len(boxes) > 0 and use_sam:
-            stats_info += "\n\n⌛ 正在执行 SAM 像素级量化..."
-            yield yolo_plot_rgb, analysis_img, stats_info, ai_suggestion, fig, profile_fig
-            
+            sam_pending = "\n\n⌛ 正在执行 SAM 像素级量化..."
+            stats_info += sam_pending
+            yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
+
             boxes_xyxy = boxes.xyxy.detach().cpu().numpy()
-            overlay, sam_info = analyze_disease_extent(image, boxes_xyxy, model_type=sam_model, device=sam_device)
+            overlay, sam_info, sam_profile = analyze_disease_extent(
+                image,
+                boxes_xyxy,
+                model_type=sam_model,
+                device=sam_device,
+                box_class_names=box_class_names_list,
+            )
             if overlay is not None:
                 analysis_img = overlay
-                stats_info = stats_info.replace("\n\n⌛ 正在执行 SAM 像素级量化...", "\n\n" + sam_info)
-                # 【第二次输出】：更新分割图和面积百分比
-                yield yolo_plot_rgb, analysis_img, stats_info, ai_suggestion, fig, profile_fig
-            
-            # 4. 生成 3D 图表 (瞬时)
-            stats_info += "\n\n⌛ 正在生成 3D 空间画像..."
-            yield yolo_plot_rgb, analysis_img, stats_info, ai_suggestion, fig, profile_fig
+                sam_done = "\n\n" + sam_info
+            else:
+                sam_done = "\n\n⚠️ SAM 像素级量化未成功：" + (sam_info or "无详情")
+                sam_profile = None
+            stats_info = stats_info.replace(sam_pending, sam_done)
+            m_rows = _collect_disease_metric_rows(
+                detections, disease_conf_sum, disease_conf_count, sam_profile
+            )
+            metrics_html = _build_disease_metrics_card_html(m_rows)
+            metrics_fig = _build_disease_metrics_bar_figure(m_rows)
+            # 【第二次输出】：SAM 结束，更新分割图与量化指标
+            yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
 
-            fig = _build_disease_prism_fig(detections, disease_areas) # 内部封装逻辑
-            profile_fig = _build_disease_profile_3d(detections, disease_areas, disease_conf_sum, disease_conf_count, disease_centers, image.shape)
-            
-            stats_info = stats_info.replace("\n\n⌛ 正在生成 3D 空间画像...", "\n\n✅ 3D 量化看板已就绪")
-            # 【第三次输出】：更新 3D 图表
-            yield yolo_plot_rgb, analysis_img, stats_info, ai_suggestion, fig, profile_fig
-
-            # 5. 如果开启 AI 智能分析 (最慢)
+            # 4. 如果开启 AI 智能分析 (最慢)
             if use_ai:
                 if not api_key:
                     ai_suggestion = "⚠️ 请填写 API Key 以开启 AI 分析"
                 else:
                     ai_suggestion = "⌛ AI 专家正在深度诊断，请稍候..."
-                    yield yolo_plot_rgb, analysis_img, stats_info, ai_suggestion, fig, profile_fig
-                    
-                    disease_str = ", ".join(detections.keys())
+                    yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
+
+                    disease_str = "、".join(_disease_cn_only(k) for k in detections.keys())
                     prompt = f"我的植物叶片检测到了以下病害：{disease_str}。请结合这些病害给出专业的诊断报告和防治建议。"
                     real_model_id = MODELS.get(ai_model, ai_model)
                     print(f"--- 正在调用 AI 模型: {real_model_id} ---")
                     ai_suggestion = ask_multimodal(image, prompt, api_key, real_model_id)
             else:
                 ai_suggestion = "AI 诊断已关闭，请勾选左侧“启用文本建议”"
-            
-            # 【最终输出】：所有数据全量更新
-            yield yolo_plot_rgb, analysis_img, stats_info, ai_suggestion, fig, profile_fig
+
+            # 【最终输出】：全量更新
+            yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
+
+        elif boxes is not None and len(boxes) > 0:
+            stats_info += (
+                "\n\nℹ️ 未启用 SAM：条形图中「叶内病斑比、叶片取景、框-掩膜一致」为占位刻度（"
+                f"{int(_SAM_METRIC_PLACEHOLDER * 100)}%）。"
+            )
+            yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
+
+            if use_ai:
+                if not api_key:
+                    ai_suggestion = "⚠️ 请填写 API Key 以开启 AI 分析"
+                else:
+                    ai_suggestion = "⌛ AI 专家正在深度诊断，请稍候..."
+                    yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
+
+                    disease_str = "、".join(_disease_cn_only(k) for k in detections.keys())
+                    prompt = f"我的植物叶片检测到了以下病害：{disease_str}。请结合这些病害给出专业的诊断报告和防治建议。"
+                    real_model_id = MODELS.get(ai_model, ai_model)
+                    print(f"--- 正在调用 AI 模型: {real_model_id} ---")
+                    ai_suggestion = ask_multimodal(image, prompt, api_key, real_model_id)
+            else:
+                ai_suggestion = "AI 诊断已关闭，请勾选左侧“启用文本建议”"
+
+            yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
 
     except Exception as e:
+        import html as html_lib
         import traceback
         traceback.print_exc()
-        # 发生错误时，确保返回 6 个值，避免前端崩溃
-        err_fig = go.Figure()
-        err_fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        yield yolo_plot_rgb, analysis_img, f"❌ 系统异常: {e}", "诊断失败", err_fig, err_fig
-
-def _build_disease_prism_fig(detections, disease_areas):
-    """
-    内部辅助：构建 3D 柱体分布图 (恢复完整视觉特效)
-    """
-    fig = go.Figure()
-    palette = ["#34D399", "#F59E0B", "#60A5FA", "#F472B6", "#22D3EE", "#A3E635", "#FB7185"]
-    
-    if not detections:
-        fig.add_trace(go.Scatter3d(x=[0], y=[0], z=[0], mode="markers+text", text=["未检出病斑"]))
-        _apply_3d_scene(fig, "病害分布", "序列", "数量", "面积", x_range=[-1, 1], y_range=[-1, 1], z_range=[0, 20])
-        return fig
-
-    diseases = list(detections.keys())
-    counts = [detections[d] for d in diseases]
-    areas = [disease_areas.get(d, 0.0) for d in diseases]
-    max_area = max(areas) if areas else 1.0
-    max_count = max(counts) if counts else 1
-    x_positions = [i * 1.25 for i in range(len(diseases))]
-
-    # 1. 恢复地面网格
-    floor_x = np.linspace(-0.8, max(x_positions) + 0.8, 14)
-    floor_y = np.linspace(0.0, max_count + 1.8, 10)
-    gx, gy = np.meshgrid(floor_x, floor_y)
-    gz = np.zeros_like(gx)
-    fig.add_trace(go.Surface(
-        x=gx, y=gy, z=gz, showscale=False,
-        colorscale=[[0, "#171b22"], [1, "#2b3340"]],
-        opacity=0.72, hoverinfo="skip"
-    ))
-
-    top_x, top_y, top_z, top_text, top_color = [], [], [], [], []
-    
-    # 2. 恢复动态缩放的柱体
-    for idx, disease in enumerate(diseases):
-        count = counts[idx]
-        area = areas[idx]
-        height = max(10.0, (area / max_area) * 100.0)
-        width = 0.48 + min(0.85, count * 0.11)
-        depth = 0.48 + min(0.85, count * 0.11)
-        y_pos = count * 0.95 + 0.5
-        color = palette[idx % len(palette)]
-
-        hover_text = f"<b>{disease}</b><br>数量: {count}<br>面积: {area:.0f}px"
-        _add_prism(fig, x_positions[idx], y_pos, width, depth, height, color, hover_text, disease)
-
-        # 准备顶部菱形数据
-        top_x.append(x_positions[idx])
-        top_y.append(y_pos)
-        top_z.append(height + 2.4)
-        top_text.append(disease)
-        top_color.append(color)
-
-    # 3. 恢复顶部菱形快速标记
-    fig.add_trace(go.Scatter3d(
-        x=top_x, y=top_y, z=top_z,
-        mode="markers+text",
-        marker=dict(symbol="diamond", size=10, color=top_color, opacity=0.9),
-        text=top_text, textposition="top center", showlegend=False
-    ))
-
-    _apply_3d_scene(fig, "病害多维空间分布量化图", 
-                    "病害类别索引 (Disease Category)", 
-                    "病斑分布丰度 (Lesion Abundance)", 
-                    "相对受损面积 (Relative Lesion Area)", 
-                    x_range=[-0.8, max(x_positions) + 0.8], 
-                    y_range=[0, max_count + 2.0], 
-                    z_range=[0, 130])
-    return fig
+        err_html = _metrics_html_placeholder(f"诊断异常：{html_lib.escape(str(e))}")
+        yield (
+            yolo_plot_rgb,
+            analysis_img,
+            f"❌ 系统异常: {e}",
+            err_html,
+            _empty_disease_metrics_fig("诊断失败"),
+            "诊断失败",
+        )
 
 
 # --------------------------------------------------------------------------------
@@ -1160,35 +1259,124 @@ def _build_disease_prism_fig(detections, disease_areas):
 TRAIN_PROC = None
 TRAIN_LOG_PATH = ROOT / "train_realtime.log"
 
+
+def _build_yolo_train_cmd(model_name, epochs, batch, imgsz, device, exp_name):
+    """
+    训练命令：
+    - 不用 yolo.exe：在 Windows 上多为非控制台入口，PIPE 常捕不到输出，且易秒退 exit=1 却无日志。
+    - 不用 python -m ultralytics：8.4+ 无 ultralytics.__main__。
+    - 使用 Python 调用 ultralytics.cfg.entrypoint(debug=...)；其中 debug 须以「yolo」开头，
+      因为 entrypoint 会对参数字符串做 [1:] 切片（模拟去掉 argv0）。
+    """
+    try:
+        import ultralytics  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        parts = [
+            "train",
+            f"model={model_name}",
+            f"data={DATA_YAML}",
+            f"epochs={int(epochs)}",
+            f"batch={int(batch)}",
+            f"imgsz={int(imgsz)}",
+            f"device={device}",
+            "project=runs/detect",
+            f"name={exp_name}",
+            "exist_ok=True",
+        ]
+        debug = "yolo " + " ".join(parts)
+        code = "from ultralytics.cfg import entrypoint; entrypoint(%r)" % (debug,)
+        return [str(sys.executable), "-u", "-c", code]
+
+    return [
+        str(sys.executable),
+        str(ROOT / "train.py"),
+        "--model",
+        str(model_name),
+        "--data",
+        str(DATA_YAML),
+        "--epochs",
+        str(int(epochs)),
+        "--batch",
+        str(int(batch)),
+        "--imgsz",
+        str(int(imgsz)),
+        "--device",
+        str(device),
+        "--project",
+        "runs/detect",
+        "--name",
+        str(exp_name),
+    ]
+
+
 def start_training(model_name, epochs, batch, imgsz, device, exp_name):
     global TRAIN_PROC
     if TRAIN_PROC and TRAIN_PROC.poll() is None:
         return "⚠️ 训练已经在运行中！"
-    
+
     if TRAIN_LOG_PATH.exists():
         TRAIN_LOG_PATH.unlink()
-        
-    cmd = [
-        str(sys.executable), "-m", "ultralytics", "train",
-        f"model={model_name}",
-        f"data={DATA_YAML}",
-        f"epochs={epochs}",
-        f"batch={batch}",
-        f"imgsz={imgsz}",
-        f"device={device}",
-        f"name={exp_name}",
-        "exist_ok=True"
-    ]
-    
+
+    cmd = _build_yolo_train_cmd(model_name, epochs, batch, imgsz, device, exp_name)
+
+    header = (
+        f"=== 训练启动 {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+        f"命令: {' '.join(cmd)}\n"
+        f"工作目录: {ROOT}\n\n"
+    )
+    TRAIN_LOG_PATH.write_text(header, encoding="utf-8")
+
+    env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "NO_PROXY": "127.0.0.1,localhost",
+    }
+
     try:
-        with open(TRAIN_LOG_PATH, "w") as f:
-            TRAIN_PROC = subprocess.Popen(
-                cmd, stdout=f, stderr=subprocess.STDOUT,
-                cwd=str(ROOT),
-                env={**os.environ, "PYTHONUNBUFFERED": "1", "NO_PROXY": "127.0.0.1,localhost"}
-            )
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+            errors="replace",
+        )
+        TRAIN_PROC = proc
+
+        def _pump_training_log():
+            """子进程 stdout 泵入文件；避免父进程过早关闭 stdout 文件导致 Windows 下日志全空。"""
+            try:
+                with open(TRAIN_LOG_PATH, "a", encoding="utf-8", errors="replace", newline="") as lf:
+                    if proc.stdout is not None:
+                        for line in proc.stdout:
+                            lf.write(line)
+                            lf.flush()
+                    code = proc.wait()
+                    lf.write(f"\n=== 进程结束 exit={code} ===\n")
+                    lf.flush()
+            except Exception as ex:
+                try:
+                    with open(TRAIN_LOG_PATH, "a", encoding="utf-8", errors="replace") as lf:
+                        lf.write(f"\n[日志泵异常] {type(ex).__name__}: {ex}\n")
+                        lf.flush()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_pump_training_log, daemon=True).start()
         return f"🚀 训练已启动 (PID: {TRAIN_PROC.pid})"
     except Exception as e:
+        TRAIN_PROC = None
+        try:
+            with open(TRAIN_LOG_PATH, "a", encoding="utf-8", errors="replace") as lf:
+                lf.write(f"\n❌ 启动失败: {type(e).__name__}: {e}\n")
+        except Exception:
+            pass
         return f"❌ 启动失败: {e}"
 
 def stop_training():
@@ -1239,12 +1427,6 @@ body {
     letter-spacing: 0;
 }
 
-.app-header .sub {
-    margin-top: 4px;
-    font-size: 0.95rem;
-    color: #cbd5e1;
-}
-
 .panel {
     border-radius: 8px !important;
     border: 1px solid rgba(255, 255, 255, 0.14) !important;
@@ -1261,9 +1443,71 @@ body {
 }
 
 .section-note {
-    color: #94a3b8;
-    font-size: 0.86rem;
+    color: #e2e8f0;
+    font-size: 0.92rem;
     margin-bottom: 10px;
+    line-height: 1.55;
+}
+
+/* 面板内主文字：避免 Soft 主题在深色背景下仍用浅灰导致看不清 */
+.panel textarea,
+.panel input[type="text"],
+.panel input[type="password"],
+.panel input[type="number"] {
+    color: #f8fafc !important;
+    background: rgba(15, 23, 42, 0.72) !important;
+    border: 1px solid rgba(148, 163, 184, 0.4) !important;
+    -webkit-text-fill-color: #f8fafc !important;
+}
+
+.panel .markdown,
+.panel .prose,
+.panel .prose p,
+.panel .prose li {
+    color: #e2e8f0 !important;
+}
+
+.panel label,
+.panel .label-wrap span,
+.panel .info {
+    color: #cbd5e1 !important;
+}
+
+.panel .table-wrap,
+.panel table {
+    color: #f1f5f9 !important;
+}
+
+/* 诊断页：检测摘要 + 量化指标合并为一块白底黑字 */
+.metrics-merged-panel.panel {
+    background: #ffffff !important;
+    border: 1px solid rgba(15, 23, 42, 0.12) !important;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.1) !important;
+}
+.metrics-merged-panel h4 {
+    color: #0f172a !important;
+}
+.metrics-merged-panel .markdown,
+.metrics-merged-panel .prose,
+.metrics-merged-panel .prose p {
+    color: #0f172a !important;
+}
+.metrics-merged-panel textarea {
+    color: #0f172a !important;
+    background: #f8fafc !important;
+    border: 1px solid #e2e8f0 !important;
+    -webkit-text-fill-color: #0f172a !important;
+}
+.metrics-merged-panel .metrics-inline-note {
+    color: #334155 !important;
+    background: #f1f5f9 !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 0.92rem;
+    line-height: 1.5;
+    margin-top: 8px;
+    margin-bottom: 0;
 }
 
 .primary-btn {
@@ -1279,6 +1523,10 @@ body {
     border-radius: 8px !important;
     background: rgba(15, 18, 22, 0.6) !important;
     border: 1px solid rgba(255, 255, 255, 0.13) !important;
+}
+
+.tab-nav button {
+    color: #e2e8f0 !important;
 }
 
 .tab-nav button.selected {
@@ -1300,13 +1548,12 @@ input[type="password"] {
 # UI 构建 (Refactored Console)
 # --------------------------------------------------------------------------------
 app_theme = gr.themes.Soft()
-demo = gr.Blocks(title="智慧农业：植物病害终端")
+demo = gr.Blocks(title="植物病害检测终端")
 
 with demo:
     gr.HTML("""
         <div class="app-header">
-            <h1>植物病害监测终端</h1>
-            <div class="sub">检测、分割、训练和模型对比在一个工作台内完成</div>
+            <h1>植物病害检测终端</h1>
         </div>
     """)
 
@@ -1316,7 +1563,7 @@ with demo:
                 with gr.Column(scale=1):
                     with gr.Group(elem_classes=["panel"]):
                         gr.Markdown("### 输入与参数")
-                        gr.HTML('<div class="section-note">上传叶片图像后可直接运行，右侧将同步更新定位、分割和 3D 统计。</div>')
+                        gr.HTML('<div class="section-note">上传叶片图像后可直接运行，右侧将同步更新定位、分割、量化指标与可选 AI 建议。</div>')
                         input_img = gr.Image(label="叶片图像", type="numpy", height=320)
 
                         with gr.Row():
@@ -1324,16 +1571,19 @@ with demo:
                                 choices=[opt[0] for opt in MODEL_OPTIONS],
                                 value=MODEL_OPTIONS[0][0] if MODEL_OPTIONS else None,
                                 label="检测模型识别引擎",
-                                type="index",
                                 scale=5,  # 缩小一点
                             )
                             conf_sld = gr.Slider(
                                 minimum=0.01, maximum=0.9, value=0.25, step=0.01, label="置信度阈值", scale=4  # 扩大约 30%
                             )
 
-                        use_sam_cb = gr.Checkbox(label="启用 SAM 分割", value=True)
+                        use_sam_cb = gr.Checkbox(label="启用 SAM 2.1 分割", value=True)
                         with gr.Row():
-                            sam_type = gr.Dropdown(choices=["vit_b", "vit_l", "vit_h"], value="vit_b", label="SAM 型号")
+                            sam_type = gr.Dropdown(
+                                choices=["vit_b", "vit_l", "vit_h"],
+                                value="vit_b",
+                                label="SAM 2.1 Hiera Large（选项为兼容旧界面，均加载同一权重）",
+                            )
                             sam_dev = gr.Radio(choices=["auto", "cuda", "cpu"], value="auto", label="设备")
 
                         use_ai_cb = gr.Checkbox(label="启用文本建议", value=False)
@@ -1354,30 +1604,33 @@ with demo:
                             yolo_res = gr.Image(label="YOLO 输出", height=300)
                         with gr.Group(elem_classes=["panel"]):
                             gr.Markdown("#### 分割结果")
-                            sam_res = gr.Image(label="SAM 输出", height=300)
+                            sam_res = gr.Image(label="SAM 输出（黄：叶片掩膜；红：叶内病变）", height=300)
 
                     with gr.Row():
-                        with gr.Group(elem_classes=["panel"]):
-                            gr.Markdown("#### 3D 病害空间图")
-                            gr.HTML('<div class="section-note">柱体高度表示受损面积，柱体尺度表示病斑数量，顶端菱形用于快速定位病害类别。</div>')
-                            plotly_chart = gr.Plot(label="病害空间图")
-                        with gr.Group(elem_classes=["panel"]):
-                            gr.Markdown("#### 3D 多维多边形图")
-                            gr.HTML('<div class="section-note">每种病害一层：框数、面积占比、均值置信、空间离散、中心偏移。</div>')
-                            disease_profile_chart = gr.Plot(label="病害多维画像")
-
-                    with gr.Row():
-                        with gr.Group(elem_classes=["panel"]):
-                            gr.Markdown("#### 检测摘要")
-                            stats_out = gr.Textbox(label="", lines=7, show_label=False)
-                        with gr.Group(elem_classes=["panel"]):
-                            gr.Markdown("#### 处理建议")
-                            ai_out = gr.Textbox(label="", lines=7, show_label=False)
+                        with gr.Column(scale=2):
+                            with gr.Group(elem_classes=["panel", "metrics-merged-panel"]):
+                                gr.Markdown("#### 检测摘要与量化指标")
+                                stats_out = gr.Textbox(
+                                    label="",
+                                    lines=7,
+                                    show_label=False,
+                                    placeholder="运行诊断后显示 YOLO/SAM 文字摘要…",
+                                )
+                                gr.HTML(
+                                    '<div class="metrics-inline-note">下方为指标卡与条形图；'
+                                    "开启 SAM 后条形图中后三项为真实值，未开 SAM 时为占位刻度。</div>"
+                                )
+                                disease_metrics_html = gr.HTML()
+                                disease_metrics_plot = gr.Plot(label="", show_label=False)
+                        with gr.Column(scale=1):
+                            with gr.Group(elem_classes=["panel"]):
+                                gr.Markdown("#### 处理建议（LLM）")
+                                ai_out = gr.Textbox(label="", lines=10, show_label=False)
 
             run_btn.click(
                 fn=smart_diagnosis,
                 inputs=[input_img, model_dd, conf_sld, use_sam_cb, sam_type, sam_dev, use_ai_cb, ai_api_key, ai_model_dd],
-                outputs=[yolo_res, sam_res, stats_out, ai_out, plotly_chart, disease_profile_chart],
+                outputs=[yolo_res, sam_res, stats_out, disease_metrics_html, disease_metrics_plot, ai_out],
             )
 
         with gr.TabItem("训练与评估"):
@@ -1389,16 +1642,28 @@ with demo:
                         tr_ep = gr.Slider(10, 300, 100, step=10, label="Epochs")
                         tr_bs = gr.Slider(4, 64, 16, step=4, label="Batch")
                         tr_sz = gr.Dropdown(["512", "640", "800"], value="512", label="图像尺寸")
-                        tr_name = gr.Textbox(value="train_v8x_new", label="实验名")
+                        tr_name = gr.Textbox(
+                            value="train_v8x_new",
+                            label="保存名称",
+                            info="训练结果将保存到 runs/detect/<保存名称>/（勿与已有目录重名，除非有意覆盖）。",
+                        )
 
                         with gr.Row():
                             tr_btn = gr.Button("启动训练", variant="primary", elem_classes=["primary-btn"])
                             tr_stop = gr.Button("停止训练", variant="stop")
-                        tr_fb = gr.Textbox(label="执行状态", lines=2)
+                        tr_fb = gr.Textbox(
+                            label="操作反馈",
+                            lines=2,
+                            info="点击「启动训练」「停止训练」后立即返回的提示：是否启动成功、进程 PID、冲突或报错等。",
+                        )
 
                     with gr.Group(elem_classes=["panel"]):
                         gr.Markdown("### 训练日志")
-                        tr_status = gr.Textbox(label="运行状态", value="空闲")
+                        tr_status = gr.Textbox(
+                            label="进程状态",
+                            value="空闲",
+                            info="定时根据训练子进程是否在运行更新（训练中 / 已停止或已完成）。完整输出见下方「实时输出」。",
+                        )
                         tr_log = gr.Textbox(label="实时输出", lines=10, autoscroll=True)
                         tr_timer = gr.Timer(value=3)
 
@@ -1415,26 +1680,34 @@ with demo:
                             bench_conf = gr.Slider(minimum=0.01, maximum=0.9, value=0.25, step=0.01, label="测速置信度", scale=2)
                         with gr.Row():
                             bench_samples = gr.Slider(minimum=20, maximum=300, value=100, step=10, label="测速样本数", scale=2)
-                            bench_warmup = gr.Slider(minimum=0, maximum=50, value=20, step=5, label="Warmup", scale=1)
+                            bench_warmup = gr.Slider(
+                                minimum=0,
+                                maximum=50,
+                                value=20,
+                                step=5,
+                                label="测速预热轮次",
+                                scale=1,
+                                info="正式统计推理耗时时，先额外跑若干次并丢弃，减轻 GPU 冷启动、缓存与算子首次编译对测速的影响。",
+                            )
                         bench_fb = gr.Textbox(label="测速状态", lines=2, value="尚未执行识别测速")
 
                         metrics_df = gr.Dataframe(
                             headers=[
                                 "模型名称", "基础权重", "轮数 (Epochs)", "批次 (Batch)", "尺寸 (ImgSz)",
-                                "mAP50", "mAP50-95", "Precision", "Recall",
+                                "mAP50", "mAP50-95", "精确率 (Precision)", "召回率 (Recall)",
                                 "平均每轮训练耗时", "推理总耗时(ms)", "FPS", "P95推理耗时(ms)", "测速设备", "测速样本数",
-                                "参数量(M)", "识别速度得分", "参数规模得分", "综合效率"
+                                "参数量(M)", "识别速度得分", "部署成本得分", "综合效率"
                             ],
                             interactive=False,
                         )
-                        gr.HTML('<div class="section-note">每个模型一层多边形：精度、召回、识别速度、参数规模与综合效率同时可见。图中环形刻度是相对对比刻度（已做鲁棒缩放），用于避免强模型把其余模型压扁成贴地形态。</div>')
+                        gr.HTML('<div class="section-note">每个模型一层多边形：精度、召回、识别速度、部署成本（参数量越小得分越高，按 log 参数量对比）与综合效率同时可见。图中环形刻度是相对对比刻度（已做鲁棒缩放），用于避免强模型把其余模型压扁成贴地形态。</div>')
                         metrics_plot = gr.Plot(label="模型多维画像")
 
             tr_btn.click(fn=start_training, inputs=[tr_base, tr_ep, tr_bs, tr_sz, gr.State("0"), tr_name], outputs=[tr_fb])
             tr_stop.click(fn=stop_training, outputs=[tr_fb])
             tr_timer.tick(fn=get_train_log, outputs=[tr_log, tr_status])
-            demo.load(fn=refresh_model_metrics, outputs=[metrics_df, metrics_plot])
-            refresh_btn.click(fn=refresh_model_metrics, outputs=[metrics_df, metrics_plot])
+            demo.load(fn=refresh_training_dashboard, outputs=[model_dd, metrics_df, metrics_plot])
+            refresh_btn.click(fn=refresh_training_dashboard, outputs=[model_dd, metrics_df, metrics_plot])
             bench_evt = bench_btn.click(
                 fn=benchmark_model_inference,
                 inputs=[bench_device, bench_imgsz, bench_conf, bench_samples, bench_warmup],
