@@ -20,7 +20,7 @@ import plotly.graph_objects as go
 # 导入自定义模块
 from sam_config import sam_status
 from sam_leaf_segment import segment_leaf, segment_from_boxes, analyze_disease_extent
-from multimodal_api import ask_multimodal, call_vision_api, MODELS, DEFAULT_API_KEY
+from multimodal_api import call_vision_api, MODELS, DEFAULT_API_KEY, run_llm_leaf_diagnosis
 
 # --------------------------------------------------------------------------------
 # 全局配置与状态
@@ -51,6 +51,142 @@ def _disease_display_name(en_key: str) -> str:
 
 def _disease_cn_only(en_key: str) -> str:
     return DISEASE_NAME_ZH.get(en_key, en_key)
+
+
+def _build_llm_detector_context(
+    detections: dict,
+    disease_conf_sum: dict,
+    disease_conf_count: dict,
+    sam_profile: dict | None,
+    sam_quant_attempted: bool,
+) -> str:
+    """供 LLM 第二轮 / 文本模型使用的 YOLO + SAM 结构化文字摘要。"""
+    lines: list[str] = []
+    lines.append("【YOLO】")
+    if not detections:
+        lines.append("无检出框。")
+    else:
+        for name, cnt in sorted(detections.items(), key=lambda x: (-x[1], x[0])):
+            n = disease_conf_count.get(name, 0)
+            mean_c = disease_conf_sum.get(name, 0.0) / max(n, 1)
+            zh = _disease_cn_only(name)
+            lines.append(
+                f"- 类名(英): {name} | 中文: {zh} | 框数: {cnt} | 置信度均值: {mean_c:.4f}"
+            )
+    lines.append("")
+    lines.append("【SAM 量化】")
+    if not sam_quant_attempted:
+        lines.append("本轮未执行 SAM（用户关闭或未进入 SAM 流程）。叶内病斑比等可能为占位或缺失。")
+    elif not sam_profile:
+        lines.append("已尝试 SAM 量化但未得到有效 profile（可能失败）。")
+    else:
+        lf = sam_profile.get("leaf_frame_confidence")
+        lines.append(f"- leaf_frame_confidence（叶片在画面中占比相关，0~1）: {lf}")
+        byd = sam_profile.get("by_disease") or {}
+        for dname, dm in byd.items():
+            lines.append(
+                f"- 类 {dname}: 叶内病斑比={float(dm.get('leaf_lesion_ratio', 0)):.4f}, "
+                f"框掩膜一致性={float(dm.get('box_mask_consistency', 0)):.4f}, "
+                f"病斑像素={int(dm.get('lesion_area_px', 0))}, 叶片像素参考={int(dm.get('leaf_area_px', 0))}"
+            )
+    return "\n".join(lines)
+
+
+def _llm_diagnosis_to_markdown(data: object) -> str:
+    """将 smart_diagnosis 第 5 路 dict 转成易读 Markdown（与 gr.JSON 同源）。"""
+    if not isinstance(data, dict):
+        return "（暂无结构化输出）"
+
+    def _line(label: str, val: object) -> str:
+        if val is None or val == "":
+            return ""
+        s = str(val).strip()
+        if not s:
+            return ""
+        return f"- **{label}**：{s}\n"
+
+    mode = data.get("mode")
+    tip = data.get("说明")
+    err = data.get("error")
+    lines: list[str] = []
+
+    mode_zh = {
+        "no_image": "未上传图像",
+        "no_weights": "无检测权重",
+        "pending": "等待推理",
+        "pending_no_yolo": "等待 LLM（无检测框）",
+        "no_detector_no_llm": "未检出且未开 LLM",
+        "loading": "LLM 请求中",
+        "llm_disabled": "未启用 LLM",
+        "vision_only_no_detection": "单轮视觉（无 YOLO 框）",
+        "two_round_vision": "两轮视觉（先图后融合）",
+        "text_only_single": "单轮文本融合（模型不可看图）",
+        "error": "异常",
+    }.get(str(mode), str(mode) if mode is not None else "")
+
+    if mode_zh:
+        lines.append(f"##### 流程状态\n{mode_zh}")
+    if tip and str(tip).strip():
+        lines.append("\n" + _line("界面提示", tip).rstrip("\n"))
+    if err:
+        lines.append("\n" + _line("错误", err).rstrip("\n"))
+        det = data.get("detail")
+        if det:
+            lines.append(_line("详情", det).rstrip("\n"))
+
+    warns = data.get("warnings")
+    if isinstance(warns, list) and warns:
+        lines.append("\n##### 系统提示")
+        for w in warns:
+            if str(w).strip():
+                lines.append(f"\n- {w}")
+
+    r1 = data.get("round1")
+    r2 = data.get("round2")
+
+    if isinstance(r1, dict) and r1:
+        lines.append("\n##### 第一轮：仅依据图像（模型尚不知道 YOLO/SAM）")
+        cands = r1.get("visual_candidates")
+        if isinstance(cands, list) and cands:
+            lines.append("\n| 可能病害 | 可能性 | 简要依据 |\n| --- | --- | --- |")
+            for c in cands[:6]:
+                if not isinstance(c, dict):
+                    continue
+                nz = str(c.get("name_zh", "")).replace("|", "｜")
+                lk = str(c.get("likelihood", "")).replace("|", "｜")
+                bb = str(c.get("brief_basis", "")).replace("|", "｜")
+                lines.append(f"\n| {nz} | {lk} | {bb} |")
+        lines.append("\n" + _line("可见症状", r1.get("symptoms_observed")).rstrip("\n"))
+        lines.append(_line("不确定性", r1.get("uncertainty")).rstrip("\n"))
+        if r1.get("_parse_error") or r1.get("_raw"):
+            lines.append("\n" + _line("解析备注", r1.get("_parse_error") or "见 JSON 中 _raw").rstrip("\n"))
+
+    if isinstance(r2, dict) and r2:
+        if mode == "vision_only_no_detection" or r2.get("mode") == "no_yolo_boxes":
+            lines.append("\n##### 单轮结论（无检测框时的视觉 JSON）")
+        elif mode == "text_only_single" or r2.get("mode") == "text_only_model":
+            lines.append("\n##### 单轮结论（纯文本模型，仅算法摘要）")
+        else:
+            lines.append("\n##### 第二轮：图像 + YOLO/SAM 交叉验证结论")
+        lines.append("\n" + _line("症状综合", r2.get("symptoms")).rstrip("\n"))
+        lines.append(_line("严重程度", r2.get("severity")).rstrip("\n"))
+        lines.append(_line("产量/品质影响", r2.get("loss_estimate")).rstrip("\n"))
+        lines.append(_line("防治建议", r2.get("treatment")).rstrip("\n"))
+        lines.append(_line("预防", r2.get("prevention")).rstrip("\n"))
+        lines.append(_line("交叉验证说明", r2.get("cross_validation")).rstrip("\n"))
+        lines.append(_line("与 YOLO 一致性", r2.get("agreement_with_yolo")).rstrip("\n"))
+        lines.append(_line("与 SAM 量化一致性", r2.get("agreement_with_sam_quant")).rstrip("\n"))
+        lines.append(_line("备注", r2.get("note")).rstrip("\n"))
+        if r2.get("_parse_error") or r2.get("_raw"):
+            lines.append("\n" + _line("解析备注", r2.get("_parse_error") or "见 JSON 中 _raw").rstrip("\n"))
+
+    out = "".join(lines).strip()
+    return out if out else "（空摘要）"
+
+
+def _smart_diag_row(yolo, sam, mh, mf, ai: dict, log: str):
+    """诊断流式输出的一行：与界面 outputs 顺序一致（含易读 Markdown）。"""
+    return (yolo, sam, mh, mf, _llm_diagnosis_to_markdown(ai), ai, log)
 
 
 def _extract_base_model_tag(base_weight):
@@ -477,11 +613,15 @@ def _collect_disease_metric_rows(
             box_cons = min(1.0, max(0.0, box_cons))
             lf = min(1.0, max(0.0, leaf_frame))
             bar_lr, bar_lf, bar_bc = raw_lr, lf, box_cons
+            lesion_px = int(dm.get("lesion_area_px", 0))
+            leaf_px = int(dm.get("leaf_area_px", 0))
         else:
             raw_lr = 0.0
             box_cons = 0.0
             lf = 0.0
             bar_lr, bar_lf, bar_bc = ph, ph, ph
+            lesion_px = 0
+            leaf_px = 0
         rows.append(
             {
                 "disease": disease,
@@ -495,6 +635,8 @@ def _collect_disease_metric_rows(
                 "bar_leaf_ratio": bar_lr,
                 "bar_leaf_frame": bar_lf,
                 "bar_box_cons": bar_bc,
+                "lesion_px": lesion_px,
+                "leaf_px": leaf_px,
                 "sam_active": active,
             }
         )
@@ -555,21 +697,23 @@ def _build_disease_metrics_card_html(rows: list[dict]) -> str:
     ]
     for r in rows:
         if r["sam_active"]:
-            lr_txt = f'{r["raw_leaf_ratio"]*100:.1f}%'
-            lf_txt = f'{r["leaf_frame"]*100:.0f}/100'
-            bc_txt = f'{r["box_cons"]*100:.1f}%'
+            sam_metrics_html = (
+                f'<div style="font-size:0.88rem;color:{_METRICS_HTML_MUTED};margin-top:6px;line-height:1.45;">'
+                f'叶内病斑 <b style="color:{_METRICS_HTML_TEXT}">{r["raw_leaf_ratio"]*100:.1f}%</b> ({r["lesion_px"]:,}px / {r["leaf_px"]:,}px)<br>'
+                f'叶片取景 <b style="color:{_METRICS_HTML_TEXT}">{r["leaf_frame"]*100:.0f}/100</b> · '
+                f'框-掩膜一致 <b style="color:{_METRICS_HTML_TEXT}">{r["box_cons"]*100:.1f}%</b>'
+                f"</div>"
+            )
         else:
-            lr_txt = "占位"
-            lf_txt = "占位"
-            bc_txt = "占位"
+            sam_metrics_html = ""
+
         parts.append(
-            f'<div style="flex:1;min-width:120px;border:1px solid #e2e8f0;border-radius:8px;'
+            f'<div style="flex:1;min-width:180px;border:1px solid #e2e8f0;border-radius:8px;'
             f'padding:10px 12px;background:{_METRICS_HTML_CARD_BG};">'
             f'<div style="font-weight:700;color:{_METRICS_HTML_TEXT};margin-bottom:4px;font-size:1rem;">{r["display"]}</div>'
             f'<div style="font-size:0.9rem;color:{_METRICS_HTML_MUTED};">框数 <b style="color:{_METRICS_HTML_TEXT}">{r["count"]}</b> · '
             f'置信均值 <b style="color:{_METRICS_HTML_TEXT}">{r["conf_mean"]*100:.1f}%</b></div>'
-            f'<div style="font-size:0.88rem;color:{_METRICS_HTML_MUTED};margin-top:6px;line-height:1.45;">'
-            f"叶内病斑 {lr_txt} · 取景 {lf_txt} · 框-掩膜 {bc_txt}</div>"
+            f"{sam_metrics_html}"
             "</div>"
         )
     parts.append("</div>")
@@ -581,7 +725,15 @@ def _build_disease_metrics_bar_figure(rows: list[dict]) -> go.Figure:
 
     if not rows:
         return _empty_disease_metrics_fig()
-    metric_labels = ["框数(归一化)", "置信度均值", "叶内病斑比", "叶片取景", "框-掩膜一致"]
+        
+    sam_active = any(r.get("sam_active") for r in rows)
+    if sam_active:
+        metric_labels = ["框数(归一化)", "置信度均值", "叶内病斑比", "叶片取景", "框-掩膜一致"]
+        colors = ["#34D399", "#60A5FA", "#F472B6", "#F59E0B", "#A78BFA"]
+    else:
+        metric_labels = ["框数(归一化)", "置信度均值"]
+        colors = ["#34D399", "#60A5FA"]
+        
     n = len(rows)
     titles = [r["display"] for r in rows]
     fig = make_subplots(
@@ -590,39 +742,36 @@ def _build_disease_metrics_bar_figure(rows: list[dict]) -> go.Figure:
         subplot_titles=titles,
         vertical_spacing=min(0.11, 0.06 + 0.02 * max(0, 4 - n)),
     )
-    colors = ["#34D399", "#60A5FA", "#F472B6", "#F59E0B", "#A78BFA"]
     for i, r in enumerate(rows, start=1):
-        xs = [
-            r["count_norm"],
-            r["conf_mean"],
-            r["bar_leaf_ratio"],
-            r["bar_leaf_frame"],
-            r["bar_box_cons"],
-        ]
-        raw_lr = r["raw_leaf_ratio"]
-        active = r["sam_active"]
-        hover = [
-            f"框数: {r['count']}（相对本图最大类归一化）",
-            f"置信度均值: {r['conf_mean']*100:.1f}%",
-            (
-                f"叶内病斑面积比: {raw_lr*100:.1f}%"
-                if active
-                else f"未启用 SAM：叶内病斑比为占位刻度（{_SAM_METRIC_PLACEHOLDER*100:.0f}%）"
-            ),
-            (
-                f"叶片取景分: {r['leaf_frame']*100:.0f}/100"
-                if active
-                else "未启用 SAM：取景为占位刻度"
-            ),
-            (
-                f"框掩膜一致性: {r['box_cons']*100:.1f}%"
-                if active
-                else f"未启用 SAM：框-掩膜为占位刻度（{_SAM_METRIC_PLACEHOLDER*100:.0f}%）"
-            ),
-        ]
+        if sam_active:
+            xs = [
+                r["count_norm"],
+                r["conf_mean"],
+                r["bar_leaf_ratio"],
+                r["bar_leaf_frame"],
+                r["bar_box_cons"],
+            ]
+            raw_lr = r["raw_leaf_ratio"]
+            hover = [
+                f"框数: {r['count']}（相对本图最大类归一化）",
+                f"置信度均值: {r['conf_mean']*100:.1f}%",
+                f"叶内病斑面积比: {raw_lr*100:.1f}% ({r.get('lesion_px', 0)}px / {r.get('leaf_px', 0)}px)",
+                f"叶片取景分: {r['leaf_frame']*100:.0f}/100",
+                f"框掩膜一致性: {r['box_cons']*100:.1f}%",
+            ]
+        else:
+            xs = [
+                r["count_norm"],
+                r["conf_mean"],
+            ]
+            hover = [
+                f"框数: {r['count']}（相对本图最大类归一化）",
+                f"置信度均值: {r['conf_mean']*100:.1f}%",
+            ]
+            
         texts = []
         for j, v in enumerate(xs):
-            if j == 3:
+            if sam_active and j == 3:
                 texts.append(f"{v*100:.0f}/100")
             else:
                 texts.append(f"{v*100:.0f}%")
@@ -1066,13 +1215,15 @@ def smart_diagnosis(image, model_choice, conf_threshold, use_sam, sam_model, sam
     """
     empty_metrics_html = _metrics_html_placeholder("请先上传图片")
     if image is None:
+        _ai0 = {"说明": "请先上传叶片图片后再运行诊断。", "mode": "no_image"}
         yield (
             None,
             None,
-            "请上传一张叶片图片",
             empty_metrics_html,
             _empty_disease_metrics_fig("请先上传图片"),
-            "请上传图片后重试",
+            _llm_diagnosis_to_markdown(_ai0),
+            _ai0,
+            "请上传一张叶片图片",
         )
         return
 
@@ -1080,7 +1231,7 @@ def smart_diagnosis(image, model_choice, conf_threshold, use_sam, sam_model, sam
     yolo_plot_rgb = None
     analysis_img = None
     stats_info = "⌛ 正在启动推理引擎..."
-    ai_suggestion = "等待中..."
+    ai_suggestion: dict = {"说明": "等待中…", "mode": "pending"}
     metrics_html = _metrics_html_placeholder("等待中…")
     metrics_fig = _empty_disease_metrics_fig("等待诊断")
 
@@ -1094,13 +1245,15 @@ def smart_diagnosis(image, model_choice, conf_threshold, use_sam, sam_model, sam
 
         opts = _scan_trained_models()
         if not opts:
+            _nw = {"error": "请完成训练或检查权重路径", "mode": "no_weights"}
             yield (
                 None,
                 None,
-                "⚠️ 未找到训练权重。请将训练输出放在 runs/detect/<保存名称>/weights/best.pt（避免 runs/detect/runs/detect 重复嵌套）。",
                 _metrics_html_placeholder("当前无可用模型权重。"),
                 _empty_disease_metrics_fig("无权重"),
-                "请完成训练或检查路径后重试",
+                _llm_diagnosis_to_markdown(_nw),
+                _nw,
+                "⚠️ 未找到训练权重。请将训练输出放在 runs/detect/<保存名称>/weights/best.pt（避免 runs/detect/runs/detect 重复嵌套）。",
             )
             return
         if isinstance(model_choice, int):
@@ -1150,7 +1303,10 @@ def smart_diagnosis(image, model_choice, conf_threshold, use_sam, sam_model, sam
             )
         else:
             stats_info = "⚪ 未检出病斑"
-            ai_suggestion = "叶片表现健康，建议定期观察。"
+            if use_ai:
+                ai_suggestion = {"说明": "即将使用 LLM（未检出框，仅依据图像）", "mode": "pending_no_yolo"}
+            else:
+                ai_suggestion = {"说明": "未检出病斑。建议定期观察。", "mode": "no_detector_no_llm"}
 
         sam_profile = None
         if detections:
@@ -1164,13 +1320,33 @@ def smart_diagnosis(image, model_choice, conf_threshold, use_sam, sam_model, sam
             metrics_fig = _build_disease_metrics_bar_figure([])
 
         # 【第一次输出】：用户能立刻看到带框的图、文字统计与指标（SAM 前为占位）
-        yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
+        yield _smart_diag_row(yolo_plot_rgb, analysis_img, metrics_html, metrics_fig, ai_suggestion, stats_info)
 
-        # 3. 如果开启 SAM 面积分析 (稍慢)
-        if boxes is not None and len(boxes) > 0 and use_sam:
+        has_boxes = boxes is not None and len(boxes) > 0
+
+        if not has_boxes:
+            if use_ai:
+                if not (api_key or "").strip():
+                    ai_suggestion = {"error": "请填写 API Key 以开启 LLM 分析"}
+                else:
+                    ai_suggestion = {"说明": "⌛ LLM 分析中（未检出框，仅视觉 JSON）…", "mode": "loading"}
+                    yield _smart_diag_row(yolo_plot_rgb, analysis_img, metrics_html, metrics_fig, ai_suggestion, stats_info)
+                    ctx = _build_llm_detector_context({}, {}, {}, None, sam_quant_attempted=False)
+                    print("--- [LLM] 无 YOLO 框，单轮视觉 ---")
+                    ai_suggestion = run_llm_leaf_diagnosis(
+                        image,
+                        api_key,
+                        ai_model,
+                        has_detector_boxes=False,
+                        detector_context=ctx,
+                    )
+                    yield _smart_diag_row(yolo_plot_rgb, analysis_img, metrics_html, metrics_fig, ai_suggestion, stats_info)
+            return
+
+        if use_sam:
             sam_pending = "\n\n⌛ 正在执行 SAM 像素级量化..."
             stats_info += sam_pending
-            yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
+            yield _smart_diag_row(yolo_plot_rgb, analysis_img, metrics_html, metrics_fig, ai_suggestion, stats_info)
 
             boxes_xyxy = boxes.xyxy.detach().cpu().numpy()
             overlay, sam_info, sam_profile = analyze_disease_extent(
@@ -1192,64 +1368,81 @@ def smart_diagnosis(image, model_choice, conf_threshold, use_sam, sam_model, sam
             )
             metrics_html = _build_disease_metrics_card_html(m_rows)
             metrics_fig = _build_disease_metrics_bar_figure(m_rows)
-            # 【第二次输出】：SAM 结束，更新分割图与量化指标
-            yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
+            yield _smart_diag_row(yolo_plot_rgb, analysis_img, metrics_html, metrics_fig, ai_suggestion, stats_info)
 
-            # 4. 如果开启 AI 智能分析 (最慢)
             if use_ai:
-                if not api_key:
-                    ai_suggestion = "⚠️ 请填写 API Key 以开启 AI 分析"
+                if not (api_key or "").strip():
+                    ai_suggestion = {"error": "请填写 API Key 以开启 LLM 分析"}
                 else:
-                    ai_suggestion = "⌛ AI 专家正在深度诊断，请稍候..."
-                    yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
-
-                    disease_str = "、".join(_disease_cn_only(k) for k in detections.keys())
-                    prompt = f"我的植物叶片检测到了以下病害：{disease_str}。请结合这些病害给出专业的诊断报告和防治建议。"
-                    real_model_id = MODELS.get(ai_model, ai_model)
-                    print(f"--- 正在调用 AI 模型: {real_model_id} ---")
-                    ai_suggestion = ask_multimodal(image, prompt, api_key, real_model_id)
+                    ai_suggestion = {"说明": "⌛ LLM 交叉验证中（先视觉后融合算法）…", "mode": "loading"}
+                    yield _smart_diag_row(yolo_plot_rgb, analysis_img, metrics_html, metrics_fig, ai_suggestion, stats_info)
+                    det_ctx = _build_llm_detector_context(
+                        detections,
+                        disease_conf_sum,
+                        disease_conf_count,
+                        sam_profile,
+                        sam_quant_attempted=True,
+                    )
+                    print("--- [LLM] 有框 + SAM 量化上下文 ---")
+                    ai_suggestion = run_llm_leaf_diagnosis(
+                        image,
+                        api_key,
+                        ai_model,
+                        has_detector_boxes=True,
+                        detector_context=det_ctx,
+                    )
             else:
-                ai_suggestion = "AI 诊断已关闭，请勾选左侧“启用文本建议”"
+                ai_suggestion = {"说明": "未启用 LLM。可勾选「启用LLM分析」。", "mode": "llm_disabled"}
 
-            # 【最终输出】：全量更新
-            yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
+            yield _smart_diag_row(yolo_plot_rgb, analysis_img, metrics_html, metrics_fig, ai_suggestion, stats_info)
 
-        elif boxes is not None and len(boxes) > 0:
+        else:
             stats_info += (
                 "\n\nℹ️ 未启用 SAM：条形图中「叶内病斑比、叶片取景、框-掩膜一致」为占位刻度（"
                 f"{int(_SAM_METRIC_PLACEHOLDER * 100)}%）。"
             )
-            yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
+            yield _smart_diag_row(yolo_plot_rgb, analysis_img, metrics_html, metrics_fig, ai_suggestion, stats_info)
 
             if use_ai:
-                if not api_key:
-                    ai_suggestion = "⚠️ 请填写 API Key 以开启 AI 分析"
+                if not (api_key or "").strip():
+                    ai_suggestion = {"error": "请填写 API Key 以开启 LLM 分析"}
                 else:
-                    ai_suggestion = "⌛ AI 专家正在深度诊断，请稍候..."
-                    yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
-
-                    disease_str = "、".join(_disease_cn_only(k) for k in detections.keys())
-                    prompt = f"我的植物叶片检测到了以下病害：{disease_str}。请结合这些病害给出专业的诊断报告和防治建议。"
-                    real_model_id = MODELS.get(ai_model, ai_model)
-                    print(f"--- 正在调用 AI 模型: {real_model_id} ---")
-                    ai_suggestion = ask_multimodal(image, prompt, api_key, real_model_id)
+                    ai_suggestion = {"说明": "⌛ LLM 交叉验证中（未跑 SAM，量化项为占位）…", "mode": "loading"}
+                    yield _smart_diag_row(yolo_plot_rgb, analysis_img, metrics_html, metrics_fig, ai_suggestion, stats_info)
+                    det_ctx = _build_llm_detector_context(
+                        detections,
+                        disease_conf_sum,
+                        disease_conf_count,
+                        sam_profile,
+                        sam_quant_attempted=False,
+                    )
+                    print("--- [LLM] 有框 / 未启用 SAM ---")
+                    ai_suggestion = run_llm_leaf_diagnosis(
+                        image,
+                        api_key,
+                        ai_model,
+                        has_detector_boxes=True,
+                        detector_context=det_ctx,
+                    )
             else:
-                ai_suggestion = "AI 诊断已关闭，请勾选左侧“启用文本建议”"
+                ai_suggestion = {"说明": "未启用 LLM。可勾选「启用LLM分析」。", "mode": "llm_disabled"}
 
-            yield yolo_plot_rgb, analysis_img, stats_info, metrics_html, metrics_fig, ai_suggestion
+            yield _smart_diag_row(yolo_plot_rgb, analysis_img, metrics_html, metrics_fig, ai_suggestion, stats_info)
 
     except Exception as e:
         import html as html_lib
         import traceback
         traceback.print_exc()
         err_html = _metrics_html_placeholder(f"诊断异常：{html_lib.escape(str(e))}")
+        _err_ai = {"error": "诊断过程异常", "detail": str(e), "mode": "error"}
         yield (
             yolo_plot_rgb,
             analysis_img,
-            f"❌ 系统异常: {e}",
             err_html,
             _empty_disease_metrics_fig("诊断失败"),
-            "诊断失败",
+            _llm_diagnosis_to_markdown(_err_ai),
+            _err_ai,
+            f"❌ 系统异常: {e}",
         )
 
 
@@ -1443,7 +1636,7 @@ body {
 }
 
 .section-note {
-    color: #e2e8f0;
+    color: #334155;
     font-size: 0.92rem;
     margin-bottom: 10px;
     line-height: 1.55;
@@ -1473,9 +1666,41 @@ body {
     color: #cbd5e1 !important;
 }
 
-.panel .table-wrap,
-.panel table {
-    color: #f1f5f9 !important;
+/* 针对 Gradio 默认组件的浅灰背景，听取建议直接把它们内部的文字改为深色，解决灰底白字问题 */
+.panel table,
+.panel table th,
+.panel table td,
+.panel table span {
+    color: #1e293b !important; /* 深灰色文字 */
+}
+
+.panel .options,
+.panel .options li {
+    color: #1e293b !important; /* 深灰色文字 */
+}
+
+/* 诊断：SAM 与推理设备同一行，三个选项横向不换行、略压缩 */
+.sam-model-device-row {
+    flex-wrap: nowrap !important;
+    align-items: flex-end !important;
+}
+.sam-model-device-row > div {
+    min-width: 0 !important;
+}
+.panel .sam-infer-device-radio .wrap,
+.panel .sam-infer-device-radio .radio-group,
+.panel .sam-infer-device-radio fieldset {
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    gap: 0.2rem !important;
+}
+.panel .sam-infer-device-radio label,
+.panel .sam-infer-device-radio span[data-testid] {
+    font-size: 0.78rem !important;
+    padding: 0.15rem 0.4rem !important;
+    white-space: nowrap !important;
 }
 
 /* 诊断页：检测摘要 + 量化指标合并为一块白底黑字 */
@@ -1508,6 +1733,85 @@ body {
     line-height: 1.5;
     margin-top: 8px;
     margin-bottom: 0;
+}
+
+/* LLM 建议：纵向更紧凑 */
+.llm-suggest-panel.panel {
+    padding: 10px 12px !important;
+}
+.llm-suggest-panel.panel h4 {
+    margin: 0 0 6px 0 !important;
+    font-size: 1.02rem !important;
+}
+.llm-suggest-panel .markdown,
+.llm-suggest-panel .prose {
+    font-size: 0.9rem !important;
+    line-height: 1.36 !important;
+}
+.llm-suggest-panel .prose h5,
+.llm-suggest-panel .markdown h5 {
+    margin: 0.35em 0 0.18em 0 !important;
+    font-size: 0.88rem !important;
+    line-height: 1.25 !important;
+}
+.llm-suggest-panel .prose p {
+    margin: 0.12em 0 !important;
+}
+.llm-suggest-panel .prose ul,
+.llm-suggest-panel .prose ol {
+    margin: 0.15em 0 0.1em 0 !important;
+    padding-left: 1.15em !important;
+}
+.llm-suggest-panel .prose li {
+    margin: 0.08em 0 !important;
+}
+.llm-suggest-panel table {
+    margin: 0.2em 0 0.15em 0 !important;
+    font-size: 0.86rem !important;
+}
+
+/* 诊断页右下：微型折叠（JSON / 日志），默认弱化 */
+.diag-debug-corner-row {
+    justify-content: flex-end !important;
+    align-items: flex-start !important;
+    flex-wrap: nowrap !important;
+    margin: 2px 0 0 0 !important;
+    gap: 0.25rem !important;
+    min-height: 0 !important;
+}
+.diag-mini-acc-wrap {
+    flex: 0 0 auto !important;
+    min-width: 0 !important;
+    max-width: 4.8rem !important;
+    opacity: 0.45 !important;
+    transition: opacity 0.15s ease, max-width 0.15s ease !important;
+}
+.diag-mini-acc-wrap:has(details[open]) {
+    max-width: min(92vw, 540px) !important;
+    z-index: 6 !important;
+    opacity: 0.98 !important;
+}
+.diag-debug-corner-row:hover .diag-mini-acc-wrap:not(:has(details[open])) {
+    opacity: 0.92 !important;
+}
+.diag-mini-acc details > summary {
+    list-style: none !important;
+    cursor: pointer !important;
+    padding: 0 2px !important;
+    font-size: 0.62rem !important;
+    letter-spacing: 0 !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    max-width: 4.2rem !important;
+    line-height: 1.15 !important;
+}
+.diag-mini-acc details[open] > summary {
+    max-width: 100% !important;
+}
+.diag-mini-acc .wrap,
+.diag-mini-acc .form {
+    min-height: 0 !important;
 }
 
 .primary-btn {
@@ -1562,37 +1866,43 @@ with demo:
             with gr.Row():
                 with gr.Column(scale=1):
                     with gr.Group(elem_classes=["panel"]):
-                        gr.Markdown("### 输入与参数")
-                        gr.HTML('<div class="section-note">上传叶片图像后可直接运行，右侧将同步更新定位、分割、量化指标与可选 AI 建议。</div>')
+                        gr.Markdown("### 输入")
                         input_img = gr.Image(label="叶片图像", type="numpy", height=320)
 
                         with gr.Row():
                             model_dd = gr.Dropdown(
                                 choices=[opt[0] for opt in MODEL_OPTIONS],
                                 value=MODEL_OPTIONS[0][0] if MODEL_OPTIONS else None,
-                                label="检测模型识别引擎",
+                                label="检测模型",
                                 scale=5,  # 缩小一点
                             )
                             conf_sld = gr.Slider(
                                 minimum=0.01, maximum=0.9, value=0.25, step=0.01, label="置信度阈值", scale=4  # 扩大约 30%
                             )
 
-                        use_sam_cb = gr.Checkbox(label="启用 SAM 2.1 分割", value=True)
-                        with gr.Row():
+                        use_sam_cb = gr.Checkbox(label="启用SAM分割", value=True)
+                        with gr.Row(elem_classes=["sam-model-device-row"]):
                             sam_type = gr.Dropdown(
-                                choices=["vit_b", "vit_l", "vit_h"],
-                                value="vit_b",
-                                label="SAM 2.1 Hiera Large（选项为兼容旧界面，均加载同一权重）",
+                                choices=["SAM 2.1", "SAM 1"],
+                                value="SAM 2.1",
+                                label="SAM模型",
+                                scale=1,
                             )
-                            sam_dev = gr.Radio(choices=["auto", "cuda", "cpu"], value="auto", label="设备")
+                            sam_dev = gr.Radio(
+                                choices=["auto", "cuda", "cpu"],
+                                value="auto",
+                                label="推理设备",
+                                scale=5,
+                                elem_classes=["sam-infer-device-radio"],
+                            )
 
-                        use_ai_cb = gr.Checkbox(label="启用文本建议", value=False)
+                        use_ai_cb = gr.Checkbox(label="启用LLM分析", value=False)
                         with gr.Row():
                             ai_api_key = gr.Textbox(label="API Key", type="password", value=DEFAULT_API_KEY, placeholder="sk-...")
                             ai_model_dd = gr.Dropdown(
                                 choices=list(MODELS.keys()),
                                 value=list(MODELS.keys())[0],
-                                label="建议模型",
+                                label="LLM模型",
                             )
 
                         run_btn = gr.Button("运行诊断", elem_classes=["primary-btn"], size="lg")
@@ -1600,7 +1910,7 @@ with demo:
                 with gr.Column(scale=2):
                     with gr.Row():
                         with gr.Group(elem_classes=["panel"]):
-                            gr.Markdown("#### 检测框")
+                            gr.Markdown("#### 检测结果")
                             yolo_res = gr.Image(label="YOLO 输出", height=300)
                         with gr.Group(elem_classes=["panel"]):
                             gr.Markdown("#### 分割结果")
@@ -1610,27 +1920,25 @@ with demo:
                         with gr.Column(scale=2):
                             with gr.Group(elem_classes=["panel", "metrics-merged-panel"]):
                                 gr.Markdown("#### 检测摘要与量化指标")
-                                stats_out = gr.Textbox(
-                                    label="",
-                                    lines=7,
-                                    show_label=False,
-                                    placeholder="运行诊断后显示 YOLO/SAM 文字摘要…",
-                                )
-                                gr.HTML(
-                                    '<div class="metrics-inline-note">下方为指标卡与条形图；'
-                                    "开启 SAM 后条形图中后三项为真实值，未开 SAM 时为占位刻度。</div>"
-                                )
                                 disease_metrics_html = gr.HTML()
                                 disease_metrics_plot = gr.Plot(label="", show_label=False)
                         with gr.Column(scale=1):
-                            with gr.Group(elem_classes=["panel"]):
+                            with gr.Group(elem_classes=["panel", "llm-suggest-panel"]):
                                 gr.Markdown("#### 处理建议（LLM）")
-                                ai_out = gr.Textbox(label="", lines=10, show_label=False)
+                                ai_readable = gr.Markdown(value="")
+
+                    with gr.Row(elem_classes=["diag-debug-corner-row"]):
+                        with gr.Column(elem_classes=["diag-mini-acc-wrap"], min_width=52):
+                            with gr.Accordion("JSON", open=False, elem_classes=["diag-mini-acc"]):
+                                ai_out = gr.JSON(label="", value={}, show_label=False)
+                        with gr.Column(elem_classes=["diag-mini-acc-wrap"], min_width=52):
+                            with gr.Accordion("日志", open=False, elem_classes=["diag-mini-acc"]):
+                                debug_log = gr.Textbox(label="", lines=8, show_label=False)
 
             run_btn.click(
                 fn=smart_diagnosis,
                 inputs=[input_img, model_dd, conf_sld, use_sam_cb, sam_type, sam_dev, use_ai_cb, ai_api_key, ai_model_dd],
-                outputs=[yolo_res, sam_res, stats_out, disease_metrics_html, disease_metrics_plot, ai_out],
+                outputs=[yolo_res, sam_res, disease_metrics_html, disease_metrics_plot, ai_readable, ai_out, debug_log],
             )
 
         with gr.TabItem("训练与评估"):
@@ -1645,7 +1953,7 @@ with demo:
                         tr_name = gr.Textbox(
                             value="train_v8x_new",
                             label="保存名称",
-                            info="训练结果将保存到 runs/detect/<保存名称>/（勿与已有目录重名，除非有意覆盖）。",
+                            info="保存至 runs/detect/<名称>/；勿与已有目录重名以免覆盖。",
                         )
 
                         with gr.Row():
@@ -1654,7 +1962,7 @@ with demo:
                         tr_fb = gr.Textbox(
                             label="操作反馈",
                             lines=2,
-                            info="点击「启动训练」「停止训练」后立即返回的提示：是否启动成功、进程 PID、冲突或报错等。",
+                            info="启动/停止后立即回显的状态摘要。",
                         )
 
                     with gr.Group(elem_classes=["panel"]):
@@ -1662,7 +1970,7 @@ with demo:
                         tr_status = gr.Textbox(
                             label="进程状态",
                             value="空闲",
-                            info="定时根据训练子进程是否在运行更新（训练中 / 已停止或已完成）。完整输出见下方「实时输出」。",
+                            info="定时刷新；详情见下方「实时输出」。",
                         )
                         tr_log = gr.Textbox(label="实时输出", lines=10, autoscroll=True)
                         tr_timer = gr.Timer(value=3)
@@ -1687,7 +1995,7 @@ with demo:
                                 step=5,
                                 label="测速预热轮次",
                                 scale=1,
-                                info="正式统计推理耗时时，先额外跑若干次并丢弃，减轻 GPU 冷启动、缓存与算子首次编译对测速的影响。",
+                                info="正式计时前先丢弃若干次推理，减轻 GPU 冷启动与首次编译影响。",
                             )
                         bench_fb = gr.Textbox(label="测速状态", lines=2, value="尚未执行识别测速")
 

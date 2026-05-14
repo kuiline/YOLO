@@ -53,12 +53,12 @@ biyesheji/
 
 | 文件 | 作用（一句话） |
 |------|----------------|
-| `app.py` | 项目主入口：上传图片检测、训练启动与日志、多模型对比表与 3D 图、SAM 分割与量化诊断等。 |
+| `app.py` | 项目主入口：上传图片检测、训练启动与日志、多模型对比表与 3D 图、SAM 分割与量化诊断、LLM 结构化诊断（易读摘要 + 右下角微型 JSON/日志折叠）等。 |
 | `train.py` | 封装 `yolo train`，指定 `data.yaml`、epochs、model 路径等，结果写入 `runs/detect/…`。 |
 | `predict.py` | 封装 `yolo predict`，对单张图或目录批量出框。 |
 | `sam_config.py` | 把 `sam2-main` 加入 `sys.path`、拼接 `sam_models` 下权重路径、返回加载失败时的提示文案。 |
 | `sam_leaf_segment.py` | 叶片分割、病害区域占比等图像逻辑，供 Gradio 或离线脚本复用。 |
-| `multimodal_api.py` | 与「多模态 / 问答 / 外部接口」相关的后端封装。 |
+| `multimodal_api.py` | 外部 LLM（SiliconFlow 等）调用：有/无检测框时的视觉或文本融合、两轮交叉验证、JSON 解析等。 |
 | `requirements.txt` | pip 依赖列表；含 `gradio`、`ultralytics` 及 SAM2 所需项等。 |
 | `run_app.bat` / `run_app.ps1` | 在已创建 `venv` 的前提下启动 `app.py`。 |
 | `run_train.ps1` | 可选：统一训练参数、工作目录的 PowerShell 示例。 |
@@ -151,6 +151,11 @@ python app.py
 ```
 
 或使用 `run_app.bat` / `run_app.ps1`（需已配置好 `venv`）。
+
+**界面提示（简要）**
+
+- **诊断**：LLM 结果以「处理建议」卡片内 Markdown 为主，排版偏紧凑；**右下角**有微型折叠 **「JSON」**（原始结构化输出，便于复制）与 **「日志」**（运行过程），默认弱化，需要时再展开。
+- **训练与评估**：各控件旁的 `info` 已压成短句（保存目录、操作反馈、进程状态刷新、测速预热含义等）；完整信息仍以「实时输出」「测速状态」为准。
 
 ### 4. 命令行训练
 
