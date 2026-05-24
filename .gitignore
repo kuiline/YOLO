@@ -29,6 +29,18 @@ test_sam.py
 # Office 临时锁文件
 ~$*
 
+# 论文写作工作区与归档（本机保留，不进入代码仓库）
+thesis_work/
+thesis_archive/
+*.doc
+*.docx
+*.pdf
+render_docx_v*/
+render_v*/
+tmp_ascii/
+.pydeps_pdfium/
+.claude/
+
 # Logs & OS
 *.log
 .DS_Store
