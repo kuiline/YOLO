@@ -324,12 +324,13 @@ def _model_fixed_color(model_name, base_weight, fallback_palette, fallback_idx):
 
 
 def _collect_training_run_dirs():
+    """在 runs/detect 下递归查找 results.csv，返回对应训练目录列表（按修改时间倒序）。"""
     if not RUNS_DETECT_DIR.is_dir():
         return []
-    seen = set()
+    seen = set()       # 已见过的目录，防重复
     rows = []
-    for csv_path in RUNS_DETECT_DIR.rglob("results.csv"):
-        run_dir = csv_path.parent
+    for csv_path in RUNS_DETECT_DIR.rglob("results.csv"):  # rglob：递归搜索所有子文件夹
+        run_dir = csv_path.parent                          # results.csv 的上一级即一次训练 run 目录
         if not run_dir.is_dir():
             continue
         try:
@@ -340,36 +341,41 @@ def _collect_training_run_dirs():
             continue
         seen.add(key)
         try:
-            mtime = run_dir.stat().st_mtime
+            mtime = run_dir.stat().st_mtime                # 目录最后修改时间，用于排序
         except OSError:
             mtime = 0.0
         rows.append((mtime, run_dir))
-    rows.sort(key=lambda x: x[0], reverse=True)
-    return [r[1] for r in rows]
+    rows.sort(key=lambda x: x[0], reverse=True)             # 新的训练排在前面
+    return [r[1] for r in rows]                            # 只返回目录路径，不要时间戳
 
 
 def _resolve_val_image_paths(sample_count=100):
+    """
+    收集测速用的验证集图片路径列表。
+    sample_count: 最多用多少张图；验证集更多时会随机抽取。
+    """
+    # 读取 data.yaml（数据集配置文件），得到 val、path 等字段
     data_cfg = _parse_simple_yaml(Path(DATA_YAML))
-    val_entry = data_cfg.get("val", "")
-    data_root = data_cfg.get("path", "")
-    yaml_parent = Path(DATA_YAML).parent
+    val_entry = data_cfg.get("val", "")      # 验证集路径，可能是文件夹或 .txt 列表
+    data_root = data_cfg.get("path", "")     # 数据集根目录
+    yaml_parent = Path(DATA_YAML).parent     # data.yaml 所在文件夹
 
     def _candidate_bases():
+        """列出可能的数据集根路径，兼容相对/绝对路径写法。"""
         candidates = []
         if data_root:
             raw = Path(data_root)
             if raw.is_absolute():
-                candidates.append(raw)
+                candidates.append(raw)  # 已是绝对路径，直接用
             else:
-                # 常见两种写法都兼容：
-                # 1) path 相对 data.yaml 所在目录
-                # 2) path 相对项目根目录
+                # 相对路径：分别尝试「相对 yaml 目录」「相对项目根」「当前目录」
                 candidates.append((yaml_parent / raw).resolve())
                 candidates.append((ROOT / raw).resolve())
                 candidates.append(raw.resolve())
         candidates.append(yaml_parent.resolve())
         candidates.append(ROOT.resolve())
 
+        # 去重，避免同一目录重复加入
         seen = set()
         uniq = []
         for c in candidates:
@@ -381,6 +387,7 @@ def _resolve_val_image_paths(sample_count=100):
 
     bases = _candidate_bases()
 
+    # 根据 val 字段拼出所有可能的验证集路径
     val_candidates = []
     if val_entry:
         v = Path(val_entry)
@@ -390,84 +397,98 @@ def _resolve_val_image_paths(sample_count=100):
             for b in bases:
                 val_candidates.append((b / v).resolve())
     else:
+        # data.yaml 没写 val 时，默认找 images/val
         for b in bases:
             val_candidates.append((b / "images" / "val").resolve())
 
+    # 取第一个真实存在的路径作为验证集位置
     val_path = None
     for c in val_candidates:
         if c.exists():
             val_path = c
             break
     if val_path is None:
-        # 最后兜底，避免空值导致异常
         val_path = val_candidates[0] if val_candidates else (yaml_parent / "images" / "val")
 
     image_paths = []
     if val_path.is_file() and val_path.suffix.lower() == ".txt":
+        # val 是文本文件：每行一张图片的路径
         with open(val_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
-                p = line.strip()
+                p = line.strip()           # 去掉首尾空白
                 if not p:
-                    continue
+                    continue               # 空行跳过
                 img = Path(p)
                 if not img.is_absolute():
-                    img = (val_path.parent / img).resolve()
+                    img = (val_path.parent / img).resolve()  # 相对路径转绝对路径
                 if img.exists():
                     image_paths.append(img)
     elif val_path.is_dir():
+        # val 是文件夹：递归找所有常见图片后缀
         exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
         image_paths = [p for p in val_path.rglob("*") if p.suffix.lower() in exts]
 
-    image_paths = sorted(set(image_paths))
+    image_paths = sorted(set(image_paths))   # 去重并排序
     if not image_paths:
-        return []
+        return []                            # 没找到任何图片
 
-    sample_count = max(1, int(sample_count))
+    sample_count = max(1, int(sample_count)) # 至少 1 张
     if len(image_paths) > sample_count:
-        rng = random.Random(42)
+        rng = random.Random(42)              # 固定随机种子，每次抽到同一批图
         image_paths = sorted(rng.sample(image_paths, sample_count))
     return image_paths
 
 
 def benchmark_model_inference(device, imgsz, conf, sample_count, warmup_count):
+    """
+    对 runs/detect 下每个训练好的模型做推理测速。
+    参数来自界面：device 设备、imgsz 输入尺寸、conf 置信度、
+    sample_count 测速图片数、warmup_count 预热次数。
+    每个模型结果写入其目录下的 benchmark.json。
+    """
+    # 扫描 runs/detect，收集所有含 results.csv 的训练目录
     run_dirs = _collect_training_run_dirs()
     if not run_dirs:
         return "⚠️ 未找到可测速模型（需在 runs/detect 下任意层级的 results.csv）"
 
+    # 从验证集取测速图片；失败则无法继续
     image_paths = _resolve_val_image_paths(sample_count=sample_count)
     if not image_paths:
         return "⚠️ 未找到验证集图像，请检查 data.yaml 的 val 路径"
 
-    sample_count = len(image_paths)
-    warmup_count = max(0, min(int(warmup_count), sample_count))
-    device_str = str(device).strip() if device is not None else "0"
-    conf_val = float(conf)
-    imgsz_val = int(imgsz)
+    sample_count = len(image_paths)                              # 实际使用的图片数量
+    warmup_count = max(0, min(int(warmup_count), sample_count))  # 预热次数限制在 0~样本数
+    device_str = str(device).strip() if device is not None else "0"  # "cuda:0" 或 "cpu"
+    conf_val = float(conf)       # 检测置信度阈值，如 0.25
+    imgsz_val = int(imgsz)       # 输入边长，如 640
 
-    updated, failed = 0, 0
-    for run_dir in run_dirs:
+    updated, failed = 0, 0       # 成功/失败计数
+    for run_dir in run_dirs:     # 逐个训练目录测速
+        # 优先用 best.pt（验证集最优），没有则用 last.pt（最后一轮）
         weight_path = run_dir / "weights" / "best.pt"
         if not weight_path.exists():
             weight_path = run_dir / "weights" / "last.pt"
         if not weight_path.exists():
             failed += 1
-            continue
+            continue               # 没有权重文件，跳过该模型
 
         try:
-            model = YOLO(str(weight_path))
+            model = YOLO(str(weight_path))  # 加载 YOLO 模型
 
-            # warmup
+            # 预热：跑 warmup_count 次 predict，不计入下面的耗时统计
+            # 作用是让 GPU 完成显存分配、内核编译等，避免首帧偏慢
             for i in range(warmup_count):
                 model.predict(
-                    source=str(image_paths[i]),
+                    source=str(image_paths[i]),  # 第 i 张测速图
                     imgsz=imgsz_val,
                     conf=conf_val,
                     device=device_str,
-                    verbose=False,
+                    verbose=False,               # 不打印日志
                 )
 
+            # 四个列表：分别存每张图的预处理、推理、后处理、总耗时（毫秒）
             pre_list, inf_list, post_list, total_list = [], [], [], []
-            wall_start = time.perf_counter()
+            wall_start = time.perf_counter()     # 记录整段测速开始时刻（秒）
             for img_path in image_paths:
                 results = model.predict(
                     source=str(img_path),
@@ -476,24 +497,28 @@ def benchmark_model_inference(device, imgsz, conf, sample_count, warmup_count):
                     device=device_str,
                     verbose=False,
                 )
+                # predict 返回列表，取第一张图的结果；speed 是耗时字典（单位 ms）
                 speed = results[0].speed if results else {}
-                pre = float(speed.get("preprocess", 0.0))
-                inf = float(speed.get("inference", 0.0))
-                post = float(speed.get("postprocess", 0.0))
-                total = pre + inf + post
+                pre = float(speed.get("preprocess", 0.0))    # 读图、缩放、归一化
+                inf = float(speed.get("inference", 0.0))     # 神经网络前向计算
+                post = float(speed.get("postprocess", 0.0))   # 解码框、NMS 等
+                total = pre + inf + post                     # 单张图总耗时
                 pre_list.append(pre)
                 inf_list.append(inf)
                 post_list.append(post)
                 total_list.append(total)
-            wall_ms = (time.perf_counter() - wall_start) * 1000.0
+            wall_ms = (time.perf_counter() - wall_start) * 1000.0  # 整段墙钟耗时转毫秒
 
             if total_list:
-                total_ms = float(np.mean(total_list))
-                p95_total_ms = float(np.percentile(total_list, 95))
+                total_ms = float(np.mean(total_list))              # 所有样本总耗时的平均值
+                p95_total_ms = float(np.percentile(total_list, 95))  # 95% 样本不超过的耗时
             else:
                 total_ms, p95_total_ms = 0.0, 0.0
 
+            # FPS = 每秒处理张数；1e-9 防止除以 0
             fps = (1000.0 / total_ms) if total_ms > 1e-9 else 0.0
+
+            # 组装测速结果，写入 JSON 供界面表格读取
             benchmark_data = {
                 "version": 1,
                 "device": device_str,
@@ -501,13 +526,13 @@ def benchmark_model_inference(device, imgsz, conf, sample_count, warmup_count):
                 "conf": conf_val,
                 "sample_count": sample_count,
                 "warmup_count": warmup_count,
-                "wall_ms": round(wall_ms, 3),
+                "wall_ms": round(wall_ms, 3),                    # 整批测速实际耗时
                 "mean_preprocess_ms": round(float(np.mean(pre_list)) if pre_list else 0.0, 4),
                 "mean_inference_ms": round(float(np.mean(inf_list)) if inf_list else 0.0, 4),
                 "mean_postprocess_ms": round(float(np.mean(post_list)) if post_list else 0.0, 4),
-                "mean_total_ms": round(total_ms, 4),
-                "p95_total_ms": round(p95_total_ms, 4),
-                "fps": round(fps, 3),
+                "mean_total_ms": round(total_ms, 4),             # 界面「推理总耗时」列
+                "p95_total_ms": round(p95_total_ms, 4),          # 界面「P95推理耗时」列
+                "fps": round(fps, 3),                            # 界面「FPS」列
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             bench_path = run_dir / "benchmark.json"
@@ -515,7 +540,7 @@ def benchmark_model_inference(device, imgsz, conf, sample_count, warmup_count):
                 json.dump(benchmark_data, f, ensure_ascii=False, indent=2)
             updated += 1
         except Exception:
-            failed += 1
+            failed += 1              # 加载或推理出错，记失败
 
     return f"✅ 识别测速完成：成功 {updated} 个模型，失败 {failed} 个模型（样本 {sample_count} 张，设备 {device_str}）"
 
@@ -1067,6 +1092,7 @@ def refresh_model_metrics():
         if not last_row:
             continue
 
+        # 若已执行过测速，读取 benchmark.json；否则 benchmark 为空字典
         benchmark = {}
         bench_path = run_dir / "benchmark.json"
         if bench_path.exists():
@@ -1093,11 +1119,12 @@ def refresh_model_metrics():
             local_weight = run_dir / "weights" / "last.pt"
         params_m = _estimate_params_million(local_weight) if local_weight.exists() else None
 
-        infer_total_ms = _to_float(benchmark.get("mean_total_ms"), 0.0)
-        p95_total_ms = _to_float(benchmark.get("p95_total_ms"), 0.0)
-        fps = _to_float(benchmark.get("fps"), 0.0)
-        bench_device = benchmark.get("device", "-")
-        bench_samples = _to_int(benchmark.get("sample_count"), 0)
+        # 从 benchmark.json 映射到表格列
+        infer_total_ms = _to_float(benchmark.get("mean_total_ms"), 0.0)   # 平均推理总耗时(ms)
+        p95_total_ms = _to_float(benchmark.get("p95_total_ms"), 0.0)    # P95 耗时(ms)
+        fps = _to_float(benchmark.get("fps"), 0.0)                      # 每秒帧数
+        bench_device = benchmark.get("device", "-")                       # 测速设备
+        bench_samples = _to_int(benchmark.get("sample_count"), 0)         # 测速样本数
 
         records.append({
             "model_name": model_name,
@@ -1118,16 +1145,16 @@ def refresh_model_metrics():
             "bench_samples": bench_samples,
         })
 
-    # 归一化分数：
-    # 1) 识别速度得分：mean_total_ms 越低得分越高（来自 benchmark）
-    # 2) 部署成本得分：参数量越小越好；在 log10(M) 上做 min-max 再取反，避免 2M vs 68M 线性刻度把中间档全压扁
+    # 把各模型的绝对指标换算成 0~1 相对得分，用于横向对比和综合效率
     if records:
+        # 收集所有已测速模型的 infer_total_ms，求最快、最慢
         speed_values = [r["infer_total_ms"] for r in records if r["infer_total_ms"] > 0]
         if speed_values:
             t_min, t_max = min(speed_values), max(speed_values)
         else:
             t_min, t_max = 0.0, 0.0
 
+        # 参数量取 log10，避免 2M 与 68M 差距过大导致中间模型得分挤在一起
         logp_vals = []
         for r in records:
             pm = r["params_m"]
@@ -1141,22 +1168,24 @@ def refresh_model_metrics():
         for rec in records:
             t = rec["infer_total_ms"]
             if t > 0 and t_max > t_min:
+                # 耗时越短得分越高：(最慢-当前)/(最慢-最快)，最快=1，最慢=0
                 speed_score = (t_max - t) / (t_max - t_min)
             elif t > 0:
-                speed_score = 1.0
+                speed_score = 1.0   # 只有一个模型有测速数据
             else:
-                speed_score = 0.5
+                speed_score = 0.5   # 未测速，给中性分
 
             p = rec["params_m"]
             if p is not None and p > 0 and lp_max > lp_min:
                 lp = math.log10(p)
+                # 参数量越小得分越高，公式同 speed_score
                 deploy_cost_score = (lp_max - lp) / (lp_max - lp_min)
             elif p is not None and p > 0:
                 deploy_cost_score = 1.0
             else:
                 deploy_cost_score = 0.5
 
-            # 综合效率：准确率主导 + 推理速度 + 部署成本（轻量更占优）
+            # 加权求和：mAP50-95×0.45 + 精确率×0.20 + 召回率×0.15 + 速度分×0.12 + 部署分×0.08
             efficiency_score = (
                 rec["map50_95"] * 0.45
                 + rec["precision"] * 0.20
@@ -1164,7 +1193,7 @@ def refresh_model_metrics():
                 + speed_score * 0.12
                 + deploy_cost_score * 0.08
             )
-            rec["speed_score"] = float(min(max(speed_score, 0.0), 1.0))
+            rec["speed_score"] = float(min(max(speed_score, 0.0), 1.0))       # 限制在 0~1
             rec["deploy_cost_score"] = float(min(max(deploy_cost_score, 0.0), 1.0))
             rec["efficiency_score"] = float(min(max(efficiency_score, 0.0), 1.0))
 
